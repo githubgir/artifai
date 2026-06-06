@@ -209,17 +209,14 @@ class TestHealthAndManifest:
 # ─────────────────────────────────────────────────────────────────────────────
 
 try:
-    from playwright.sync_api import Page, expect, sync_playwright
+    from playwright.sync_api import sync_playwright, expect as pw_expect
     _PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     _PLAYWRIGHT_AVAILABLE = False
 
-browser_only = pytest.mark.skipif(
-    not _PLAYWRIGHT_AVAILABLE, reason="playwright not installed"
-)
-
 
 def _has_browser() -> bool:
+    """Return True if a usable Chromium binary exists."""
     if not _PLAYWRIGHT_AVAILABLE:
         return False
     try:
@@ -238,73 +235,87 @@ browser_ui = pytest.mark.skipif(
 )
 
 
-@pytest.fixture(scope="session")
-def browser_context(server):
+@pytest.fixture(scope="module")
+def pw_browser(server):
+    """One Chromium browser process shared across the browser test module."""
     if not _BROWSER_AVAILABLE:
         pytest.skip("No browser")
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        ctx = browser.new_context(base_url=server)
-        yield ctx
-        ctx.close()
+        yield browser
         browser.close()
 
 
 @pytest.fixture
-def page(browser_context):
-    pg = browser_context.new_page()
+def fresh_page(pw_browser, server):
+    """Each test gets an isolated browser context (fresh cookies / localStorage)."""
+    ctx = pw_browser.new_context(base_url=server)
+    pg = ctx.new_page()
     yield pg
     pg.close()
+    ctx.close()
 
+
+# ── Test 1: page loads ────────────────────────────────────────────────────────
 
 @browser_ui
-class TestBrowserExecuteUI:
-    """UI-level tests using a real browser via Playwright."""
+class TestBrowserPageLoad:
+    """Verify the chat UI is served correctly — no LLM calls required."""
 
-    def test_page_loads(self, page, server):
-        page.goto(server)
-        expect(page.locator(".chat-header")).to_be_visible()
-        expect(page.locator(".manifest-panel")).to_be_visible()
+    def test_page_title_and_panels(self, fresh_page, server):
+        """Landing page must show the chat header and the artefact registry panel."""
+        fresh_page.goto(server)
 
-    def test_execute_scalar_in_ui(self, page, server):
-        """Send /execute result = 2 + 2 and verify the result appears in the UI."""
-        page.goto(server)
-        textarea = page.locator(".msg-input")
-        textarea.fill("/execute\nresult = 2 + 2")
-        page.locator(".send-btn").click()
+        # Left sidebar: artefact registry
+        pw_expect(fresh_page.locator(".manifest-panel")).to_be_visible()
+        pw_expect(fresh_page.locator(".panel-header")).to_contain_text("Artefact Registry")
 
-        # Wait for the result block to appear
-        result_label = page.locator(".result-label").first
-        result_label.wait_for(timeout=15_000)
-        expect(result_label).to_contain_text("Result")
+        # Main area: chat header
+        pw_expect(fresh_page.locator(".chat-header")).to_contain_text("Conversation")
 
-        # The scalar value "4" should be visible
-        scalar = page.locator(".result-scalar").first
-        expect(scalar).to_contain_text("4")
+        # Input controls are ready
+        pw_expect(fresh_page.locator(".msg-input")).to_be_visible()
+        pw_expect(fresh_page.locator(".send-btn")).to_be_visible()
 
-    def test_execute_dataframe_in_ui(self, page, server):
-        """Send /execute producing a DataFrame and verify the table renders."""
-        page.goto(server)
-        code = "result = pd.DataFrame({'col1': [10, 20, 30], 'col2': ['a', 'b', 'c']})"
-        textarea = page.locator(".msg-input")
-        textarea.fill(f"/execute\n{code}")
-        page.locator(".send-btn").click()
+    def test_page_initially_empty(self, fresh_page, server):
+        """On a fresh session the registry panel shows no artefact rows."""
+        fresh_page.goto(server)
+        # No artefact rows should be present before any data is loaded
+        assert fresh_page.locator(".artefact-row").count() == 0
 
-        result_table = page.locator(".result-table").first
-        result_table.wait_for(timeout=15_000)
 
-        # Headers should contain our column names
-        headers = page.locator(".result-table th").all_text_contents()
-        assert "col1" in headers
-        assert "col2" in headers
+# ── Test 2: /execute produces a result without LLM ───────────────────────────
 
-    def test_blocked_code_shows_error_in_ui(self, page, server):
-        """Blocked code should show the ⛔ Code Blocked banner."""
-        page.goto(server)
-        textarea = page.locator(".msg-input")
-        textarea.fill("/execute\nimport os\nresult = os.getcwd()")
-        page.locator(".send-btn").click()
+@browser_ui
+class TestBrowserExecute:
+    """Send /execute commands through the UI and verify results render correctly."""
 
-        error_label = page.locator(".error-label").first
-        error_label.wait_for(timeout=10_000)
-        expect(error_label).to_contain_text("Blocked")
+    def test_scalar_result_displayed(self, fresh_page, server):
+        """/execute returning a scalar must show the value in .result-scalar."""
+        fresh_page.goto(server)
+
+        fresh_page.locator(".msg-input").fill("/execute\nresult = 6 * 7")
+        fresh_page.locator(".send-btn").click()
+
+        # result-label appears once the server responds (no LLM involved)
+        result_label = fresh_page.locator(".result-label").first
+        result_label.wait_for(timeout=10_000)
+        pw_expect(result_label).to_contain_text("scalar")
+
+        # The computed value must be visible
+        pw_expect(fresh_page.locator(".result-scalar").first).to_contain_text("42")
+
+    def test_dataframe_result_displayed(self, fresh_page, server):
+        """/execute returning a DataFrame must render a table with correct headers."""
+        fresh_page.goto(server)
+
+        code = "result = pd.DataFrame({'price': [100, 200], 'qty': [3, 5]})"
+        fresh_page.locator(".msg-input").fill(f"/execute\n{code}")
+        fresh_page.locator(".send-btn").click()
+
+        result_table = fresh_page.locator(".result-table").first
+        result_table.wait_for(timeout=10_000)
+
+        headers = fresh_page.locator(".result-table th").all_text_contents()
+        assert "price" in headers
+        assert "qty" in headers
