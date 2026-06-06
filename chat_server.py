@@ -55,7 +55,7 @@ def get_session(session_id: str) -> Session:
 # Set LLM_PROVIDER=openai to use OpenAI; defaults to anthropic.
 # ─────────────────────────────────────────────────────────────────────────────
 
-LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "openai").lower()
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "anthropic").lower()
 
 if LLM_PROVIDER == "openai":
     import openai as _openai
