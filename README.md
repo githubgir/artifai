@@ -16,7 +16,7 @@ Generic, LLM-driven tabular data registry with sandboxed Python execution.
 
 ```bash
 # Install uv (if not already installed)
-curl -LsSf https://astral.sh/uv/install.sh | sh
+pip install uv
 
 # Install dependencies
 uv sync
