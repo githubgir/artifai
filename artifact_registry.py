@@ -125,7 +125,12 @@ class ArtefactRegistry:
     def manifest(self) -> str:
         if not self._store:
             return "(no artefacts registered)"
-        lines = []
+        lines = [
+            "SHARED DIMENSIONS: instrument_id, ISIN, SEDOL, CUSIP are consistent join keys across all artefacts.",
+            "FREQUENCY NOTE: 'date' is daily (business days); 'effective_date' is monthly (first business day of each month).",
+            "  → Always align these two time axes via asof-join or forward-fill before concatenating daily and monthly artefacts.",
+            "",
+        ]
         for art in self._store.values():
             icon = _PROVENANCE_ICON[art.provenance]
             tag  = f"[{art.provenance.value}]"
