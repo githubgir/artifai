@@ -27,7 +27,6 @@ from artifact_registry import (
 from fixtures import (
     make_all_fixtures,
     make_returns_csv_bytes,
-    make_returns_series,
     make_universe_csv_bytes,
 )
 from code_examples import VALID_EXAMPLES, VIOLATING_EXAMPLES
@@ -40,11 +39,18 @@ from code_examples import VALID_EXAMPLES, VIOLATING_EXAMPLES
 @pytest.fixture
 def registry() -> ArtefactRegistry:
     reg = ArtefactRegistry()
+    descriptions = {
+        "universe":         "Static universe file: 1 000 stocks with region, industry, ISIN, SEDOL, CUSIP",
+        "stock_returns":    "Daily total return matrix: 5 years of business days × 1 000 instruments",
+        "position_history": "Monthly rebalancing weights (benchmark + index) and market cap per stock",
+        "factor_exposures": "Factor loading matrix at monthly rebalancing dates: Value, Quality, Momentum, Low Vol, Size",
+        "user_signals":     "Weekly proprietary signals per ISIN: Proprietary 1, Proprietary 2",
+    }
     for name, data in make_all_fixtures().items():
         reg.register(
             name=name,
             data=data,
-            description=f"Synthetic test artefact: {name}",
+            description=descriptions[name],
             provenance=Provenance.ENGINE,
         )
     return reg
@@ -62,14 +68,14 @@ def empty_registry() -> ArtefactRegistry:
 class TestRegistry:
 
     def test_register_and_retrieve(self, registry):
-        data = registry.get("returns")
-        assert isinstance(data, pd.Series)
-        assert len(data) == 1000
+        data = registry.get("stock_returns")
+        assert isinstance(data, pd.DataFrame)
+        assert data.shape[1] == 1000
 
     def test_overwrite(self, registry):
         new_series = pd.Series([1.0, 2.0, 3.0])
-        registry.register("returns", new_series, "overwritten", Provenance.DERIVED)
-        assert len(registry.get("returns")) == 3
+        registry.register("stock_returns", new_series, "overwritten", Provenance.DERIVED)
+        assert len(registry.get("stock_returns")) == 3
 
     def test_get_missing_raises_key_error(self, registry):
         with pytest.raises(KeyError, match="not found"):
@@ -78,7 +84,7 @@ class TestRegistry:
     def test_key_error_lists_available_names(self, registry):
         with pytest.raises(KeyError) as exc_info:
             registry.get("missing")
-        assert "returns" in str(exc_info.value)
+        assert "stock_returns" in str(exc_info.value)
 
     def test_invalid_provenance_raises(self, registry):
         with pytest.raises(ValueError, match="Unknown provenance"):
@@ -86,24 +92,25 @@ class TestRegistry:
 
     def test_names(self, registry):
         names = registry.names()
-        assert "returns" in names
+        assert "stock_returns" in names
         assert "position_history" in names
+        assert "universe" in names
 
     def test_len(self, registry):
-        assert len(registry) == 4
+        assert len(registry) == 5
 
     def test_clear(self, registry):
         registry.clear()
         assert len(registry) == 0
 
-    def test_dtype_summary_dataframe(self, registry):
+    def test_dtype_summary_position_history(self, registry):
         art = registry.get_artefact("position_history")
-        assert "500" in art.dtype_summary
-        assert "50" in art.dtype_summary
+        assert "60,000" in art.dtype_summary
+        assert "3" in art.dtype_summary
 
-    def test_dtype_summary_series(self, registry):
-        art = registry.get_artefact("returns")
-        assert "Series" in art.dtype_summary
+    def test_dtype_summary_stock_returns(self, registry):
+        art = registry.get_artefact("stock_returns")
+        assert "DataFrame" in art.dtype_summary
         assert "1,000" in art.dtype_summary
 
     def test_parent_artefacts_recorded(self, registry):
@@ -112,11 +119,11 @@ class TestRegistry:
             pd.Series([1.0]),
             "a derived artefact",
             Provenance.DERIVED,
-            parents=["returns", "benchmark"],
+            parents=["stock_returns", "factor_exposures"],
         )
         art = registry.get_artefact("derived_thing")
-        assert "returns" in art.parent_artefacts
-        assert "benchmark" in art.parent_artefacts
+        assert "stock_returns" in art.parent_artefacts
+        assert "factor_exposures" in art.parent_artefacts
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -150,11 +157,11 @@ class TestManifest:
             pd.Series([1.0]),
             "child artefact",
             Provenance.DERIVED,
-            parents=["returns"],
+            parents=["stock_returns"],
         )
         m = registry.manifest()
         assert "derived from" in m
-        assert "returns" in m
+        assert "stock_returns" in m
 
     def test_manifest_is_plain_string(self, registry):
         m = registry.manifest()
@@ -163,8 +170,8 @@ class TestManifest:
     def test_manifest_no_data_in_output(self, registry):
         """Manifest must not contain raw data values."""
         m = registry.manifest()
-        # position_history has values like 0.02341 — should not appear
-        assert "0.02341" not in m
+        # position_history benchmark_weight values like 0.00123 should not appear
+        assert "0.00123" not in m
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -199,7 +206,6 @@ class TestAstCheck:
     def test_deduplicated_violations(self):
         code = "import os\nimport sys"
         violations = _ast_check(code)
-        # Should deduplicate to one "import" violation
         assert len([v for v in violations if "import" in v]) == 1
 
 
@@ -225,13 +231,13 @@ class TestValidExecution:
 
     def test_stdout_captured(self, registry):
         code = 'print("hello from sandbox")\nresult = 42'
-        res = run_analysis(code, registry, ["returns"])
+        res = run_analysis(code, registry, ["stock_returns"])
         assert res.success
         assert "hello from sandbox" in res.stdout
 
     def test_duration_recorded(self, registry):
-        code = "result = returns.mean()"
-        res = run_analysis(code, registry, ["returns"])
+        code = "result = stock_returns.iloc[:, 0].mean()"
+        res = run_analysis(code, registry, ["stock_returns"])
         assert res.duration_ms > 0
 
 
@@ -272,13 +278,13 @@ class TestViolatingExecution:
     def test_dry_run_catches_violations(self, registry):
         """Dry run should catch all AST violations without executing."""
         code = "import os\nresult = os.listdir('.')"
-        result = run_analysis(code, registry, ["returns"], dry_run=True)
+        result = run_analysis(code, registry, ["stock_returns"], dry_run=True)
         assert not result.success
         assert "import" in result.error.lower()
 
     def test_dry_run_passes_valid_code(self, registry):
-        code = "result = returns.mean()"
-        result = run_analysis(code, registry, ["returns"], dry_run=True)
+        code = "result = stock_returns.iloc[:, 0].mean()"
+        result = run_analysis(code, registry, ["stock_returns"], dry_run=True)
         assert result.success
 
 
@@ -300,9 +306,10 @@ class TestIngester:
         assert result.classification == "reference_data"
 
     def test_returns_csv_classification(self):
+        # Column names are instrument IDs (INST_xxxx) — no source/reference hint
         raw = make_returns_csv_bytes()
         result = ingest_file("returns.csv", raw)
-        assert result.classification == "source_data"
+        assert result.classification == "ambiguous"
 
     def test_suggested_name_slugified(self):
         raw = make_universe_csv_bytes()
@@ -324,9 +331,9 @@ class TestIngester:
         result = ingest_file(
             "returns.csv",
             raw,
-            llm_describe=lambda fn, df: "A daily return series from a unit test",
+            llm_describe=lambda fn, df: "A daily return matrix from a unit test",
         )
-        assert result.description == "A daily return series from a unit test"
+        assert result.description == "A daily return matrix from a unit test"
 
     def test_failed_llm_describe_falls_back(self):
         raw = make_returns_csv_bytes()
@@ -352,19 +359,19 @@ class TestChainedAnalysis:
 
     def test_three_step_chain(self, registry):
         """
-        Step 1: compute cumulative returns → register as derived
-        Step 2: compute drawdown from cum_returns → register as derived
-        Step 3: find worst drawdown date from drawdowns → scalar
+        Step 1: cumulative return for first stock → register as derived
+        Step 2: drawdown series from cum_returns → register as derived
+        Step 3: date of worst drawdown → scalar string
         Each step depends on the previous.
         """
         # Step 1
         r1 = run_analysis(
-            "result = (1 + returns).cumprod()",
-            registry, ["returns"]
+            "result = (1 + stock_returns.iloc[:, 0]).cumprod()",
+            registry, ["stock_returns"]
         )
         assert r1.success
         registry.register("cum_returns", r1.output, "Cumulative return index",
-                          Provenance.DERIVED, parents=["returns"])
+                          Provenance.DERIVED, parents=["stock_returns"])
 
         # Step 2
         r2 = run_analysis(
@@ -393,31 +400,35 @@ result = (cum_returns - rolling_max) / rolling_max
         assert "derived from" in m
 
     def test_join_uploaded_with_engine_artefact(self, registry):
-        """User uploads a benchmark; LLM code joins it against engine returns."""
-        raw = make_returns_csv_bytes()
-        ingested = ingest_file("benchmark.csv", raw)
+        """User uploads universe CSV; code joins latest position weights with universe metadata."""
+        raw = make_universe_csv_bytes()
+        ingested = ingest_file("universe_upload.csv", raw)
         registry.register(
-            ingested.suggested_artefact_name,
-            ingested.df.iloc[:, 0],   # first column as Series
+            "uploaded_universe",
+            ingested.df,
             ingested.description,
             Provenance.USER_UPLOAD,
         )
 
         code = """
-bench = benchmark.rename("bench")
-combined = returns.to_frame("returns").join(bench, how="inner")
-result = combined.corr()
+latest_date = position_history.index.get_level_values("effective_date").max()
+pos = position_history.loc[latest_date]
+result = pos.join(uploaded_universe[["region", "industry"]])
 """
-        r = run_analysis(code, registry, ["returns", "benchmark"])
+        r = run_analysis(code, registry, ["position_history", "uploaded_universe"])
         assert r.success
         assert isinstance(r.output, pd.DataFrame)
-        assert r.output.shape == (2, 2)
+        # 3 weight/mcap columns + 2 metadata columns
+        assert r.output.shape[1] == 5
 
     def test_derived_artefact_in_manifest_shows_parents(self, registry):
-        r = run_analysis("result = returns.rolling(20).std()", registry, ["returns"])
+        r = run_analysis(
+            "result = stock_returns.rolling(20).std()",
+            registry, ["stock_returns"]
+        )
         assert r.success
         registry.register("rolling_vol", r.output, "20-day rolling volatility",
-                          Provenance.DERIVED, parents=["returns"])
+                          Provenance.DERIVED, parents=["stock_returns"])
         m = registry.manifest()
         assert "rolling_vol" in m
-        assert "returns" in m
+        assert "stock_returns" in m

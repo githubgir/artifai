@@ -153,10 +153,11 @@ def load_test_data(session_id: str = "default"):
     session = get_session(session_id)
     fixtures = make_all_fixtures()
     descriptions = {
-        "returns":          "Synthetic daily return series with vol clustering, 1000 trading days",
-        "position_history": "Synthetic constituent weight matrix, 500 dates × 50 assets, rows sum to 1",
-        "factor_exposures": "Synthetic factor loading matrix, 500 dates × 5 factors (Value/Momentum/Quality/LowVol/Size)",
-        "benchmark":        "Synthetic benchmark return series, partially correlated with returns",
+        "universe":         "Static universe: 1 000 stocks with stock_name, region, industry, ISIN, freefloat, SEDOL, CUSIP",
+        "stock_returns":    "Daily total return matrix: 5 years of business days × 1 000 instruments, GARCH-like vol clustering",
+        "position_history": "Monthly rebalancing weights (benchmark_weight, index_weight, mcap_usd) per instrument; weights sum to 1.0 per date",
+        "factor_exposures": "Factor loading matrix at monthly dates: Value, Quality, Momentum, Low Vol, Size",
+        "user_signals":     "Weekly proprietary signals per ISIN (Proprietary 1, Proprietary 2); dates misaligned with rebalancing dates",
     }
     for name, data in fixtures.items():
         session.registry.register(
@@ -495,7 +496,7 @@ function App() {
     refreshManifest();
     setMessages(m => [...m, {
       role: "assistant", id: Date.now().toString(),
-      text: d.message + "\\n\\nYou can now ask me to analyse these datasets. Try: \"What does the return distribution look like?\" or \"Compare the returns against the benchmark.\""
+      text: d.message + "\\n\\nYou can now ask me to analyse these datasets. Try: \"What does the return distribution look like for the top 10 stocks?\" or \"Join the latest benchmark weights to the universe metadata.\""
     }]);
   };
 

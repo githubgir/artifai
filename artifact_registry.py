@@ -274,12 +274,23 @@ def run_analysis(
         )
 
     # 3. Execute in child process
-    ctx = mp.get_context("spawn")
+    # fork avoids re-importing heavy deps on every call; the child inherits the
+    # parent's memory so startup is near-instant.
+    ctx = mp.get_context("fork")
     q   = ctx.Queue()
     p   = ctx.Process(target=_worker, args=(code, artefact_data, q))
     t0  = time.monotonic()
     p.start()
-    p.join(timeout)
+
+    # Read result BEFORE joining. With large DataFrames the child blocks on
+    # q.put() because the pipe buffer fills up, and the parent blocks on
+    # p.join() — a deadlock. Draining first resolves it.
+    try:
+        payload = q.get(timeout=timeout)
+    except Exception:
+        payload = None
+
+    p.join(2)  # give child time to exit cleanly after we have its result
     elapsed_ms = (time.monotonic() - t0) * 1000
 
     if p.is_alive():
@@ -292,15 +303,13 @@ def run_analysis(
             duration_ms=elapsed_ms,
         )
 
-    if q.empty():
+    if payload is None:
         return ExecutionResult(
             success=False,
             error="Child process exited without returning a result",
             code=code,
             duration_ms=elapsed_ms,
         )
-
-    payload = q.get_nowait()
 
     if payload[0] == "ok":
         _, output, stdout = payload
