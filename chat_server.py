@@ -28,6 +28,7 @@ from typing import Any
 import uvicorn
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 from artifact_registry import ArtefactRegistry, ExecutionResult, Provenance, run_analysis, ingest_file
 from fixtures import make_all_fixtures
@@ -173,6 +174,10 @@ def extract_requested_artefacts(code: str, available: list[str]) -> list[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="Artefact Registry Chat")
+
+_STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+if os.path.isdir(_STATIC_DIR):
+    app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -465,9 +470,9 @@ REACT_APP = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Artefact Registry Chat</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.development.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.development.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<script src="/static/react.min.js"></script>
+<script src="/static/react-dom.min.js"></script>
+<script src="/static/babel.min.js"></script>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -618,7 +623,7 @@ function App() {
     refreshManifest();
     setMessages(m => [...m, {
       role: "assistant", id: Date.now().toString(),
-      text: d.message + "\\n\\nYou can now ask me to analyse these datasets. Try: \"What does the return distribution look like for the top 10 stocks?\" or \"Join the latest benchmark weights to the universe metadata.\""
+      text: d.message + `\n\nYou can now ask me to analyse these datasets. Try: 'What does the return distribution look like for the top 10 stocks?' or 'Join the latest benchmark weights to the universe metadata.'`
     }]);
   };
 

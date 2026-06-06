@@ -215,13 +215,26 @@ except ImportError:
     _PLAYWRIGHT_AVAILABLE = False
 
 
+_CHROMIUM_EXECUTABLE = os.environ.get(
+    "PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH",
+    "/opt/pw-browsers/chromium-1194/chrome-linux/chrome",
+)
+
+
+def _chromium_launch_kwargs() -> dict:
+    import shutil
+    if shutil.which(_CHROMIUM_EXECUTABLE) or os.path.isfile(_CHROMIUM_EXECUTABLE):
+        return {"executable_path": _CHROMIUM_EXECUTABLE}
+    return {}
+
+
 def _has_browser() -> bool:
     """Return True if a usable Chromium binary exists."""
     if not _PLAYWRIGHT_AVAILABLE:
         return False
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(headless=True, **_chromium_launch_kwargs())
             browser.close()
             return True
     except Exception:
@@ -241,7 +254,7 @@ def pw_browser(server):
     if not _BROWSER_AVAILABLE:
         pytest.skip("No browser")
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=True, **_chromium_launch_kwargs())
         yield browser
         browser.close()
 
