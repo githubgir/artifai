@@ -15,15 +15,24 @@ Generic, LLM-driven tabular data registry with sandboxed Python execution.
 ## Quick Start
 
 ```bash
-pip install fastapi uvicorn anthropic pandas numpy openpyxl pyarrow python-multipart pytest
+# Install dependencies
+uv sync
 
 # Run tests
-pytest test_artifact_registry.py -v
+uv run pytest -v
 
-# Start chat UI
-export ANTHROPIC_API_KEY=sk-...
-python chat_server.py
+# Run a single test
+uv run pytest test_artifact_registry.py::test_name -v
+
+# Start chat UI (Anthropic, default)
+export ANTHROPIC_API_KEY=sk-ant-...
+uv run python chat_server.py
 # → http://localhost:8000
+
+# Start chat UI (OpenAI)
+export LLM_PROVIDER=openai
+export OPENAI_API_KEY=sk-...
+uv run python chat_server.py
 ```
 
 ## Synthetic fixtures
