@@ -13,6 +13,8 @@ import io
 import numpy as np
 import pandas as pd
 
+from artifact_registry import ArtefactRegistry, Provenance
+
 N_INSTRUMENTS = 1000
 _START_DATE = "2020-01-02"
 _END_DATE = "2025-01-01"
@@ -86,12 +88,16 @@ def make_stock_returns_series() -> pd.DataFrame:
     """
     Daily total return matrix with realistic vol clustering (GARCH-like).
 
-    Index   : date — 5 years of business days (~1 305 rows)
-    Columns : instrument_id — 1 000 stocks
+    Index   : date — 5 years of business days (~1 305 rows); DAILY frequency.
+    Columns : instrument_id — 1 000 stocks (shared key with all other fixtures)
 
     Values represent daily total return  r_t = p_t / p_{t-1} − 1, where the
     common market factor follows GARCH(1,1) dynamics and each stock adds
     idiosyncratic noise scaled by a random beta.
+
+    ALIGNMENT: date (daily) is at a different frequency than effective_date
+    (monthly) used by position_history and factor_exposures.  Forward-fill or
+    asof-join on the time axis before concatenating with those artefacts.
     """
     rng = np.random.default_rng(42)
     dates = _business_dates()
@@ -126,11 +132,18 @@ def make_position_history() -> pd.DataFrame:
     """
     Portfolio weight history at monthly rebalancing dates.
 
-    Index   : (effective_date, instrument_id)  — MultiIndex
+    Index   : (effective_date, instrument_id) — MultiIndex; MONTHLY frequency.
+              effective_date = first business day of each month (~61 dates).
+              instrument_id is a shared key with all other fixtures.
     Columns : benchmark_weight, index_weight, mcap_usd
 
     benchmark_weight and index_weight each sum to exactly 1.0 for every
     effective_date. mcap_usd is in USD millions and varies across dates.
+
+    ALIGNMENT: effective_date (monthly) differs from date (daily) in
+    stock_returns.  Forward-fill weights to business-day frequency or use an
+    asof-join before combining with that artefact.
+    Can be merged directly with factor_exposures on (effective_date, instrument_id).
     """
     rng = np.random.default_rng(43)
     eff_dates = _effective_dates()
@@ -170,12 +183,18 @@ def make_factor_exposures() -> pd.DataFrame:
     """
     Factor loading matrix at monthly rebalancing dates.
 
-    Index   : (effective_date, instrument_id)  — MultiIndex
-    Columns : factor_id — "Value", "Quality", "Momentum", "Low Vol", "Size"
+    Index   : (effective_date, instrument_id) — MultiIndex; MONTHLY frequency.
+              effective_date = first business day of each month, aligned with
+              position_history.  instrument_id is a shared key with all fixtures.
+    Columns : factor — "Value", "Quality", "Momentum", "Low Vol", "Size"
 
     Loadings are approximately mean-zero and unit-variance cross-sectionally.
     The Value factor carries a slow time-series drift to make the data
     non-trivially time-varying.
+
+    ALIGNMENT: shares (effective_date, instrument_id) with position_history —
+    merge directly on those keys.  To combine with stock_returns (daily date),
+    forward-fill factor exposures to business-day frequency first.
     """
     rng = np.random.default_rng(44)
     eff_dates = _effective_dates()
@@ -204,12 +223,15 @@ def make_user_signals() -> pd.DataFrame:
     """
     Proprietary signal matrix at weekly (Wednesday) signal dates.
 
-    Index   : (ISIN, signal_date)  — MultiIndex
-    Columns : "Proprietary 1", "Proprietary 2"
+    Index   : (ISIN, signal_date) — MultiIndex; WEEKLY frequency (every Wednesday).
+              signal_date is intentionally misaligned with both effective_date
+              (monthly) and date (daily).  ISINs are consistent with
+              make_universe_file() and all other fixtures.
+    Columns : "Proprietary 1", "Proprietary 2" (AR(1) persistence across dates)
 
-    signal_date is intentionally NOT aligned with effective_date (weekly vs
-    monthly), requiring a forward-fill / asof join to combine with other
-    fixtures.  ISINs are consistent with make_universe_file().
+    ALIGNMENT: signal_date (weekly) aligns with neither date (daily) nor
+    effective_date (monthly).  Join to other artefacts via ISIN using an
+    asof-join or forward-fill on the time axis.
     """
     rng = np.random.default_rng(47)
     universe = make_universe_file()
@@ -265,3 +287,62 @@ def make_all_fixtures() -> dict:
         "factor_exposures": make_factor_exposures(),
         "user_signals":     make_user_signals(),
     }
+
+
+_FIXTURE_DESCRIPTIONS = {
+    "universe": (
+        "Index: instrument_id (1 000 stocks, unique). "
+        "Columns: stock_name, region, industry, ISIN, freefloat, SEDOL, CUSIP. "
+        "Join to other artefacts on instrument_id, ISIN, SEDOL, or CUSIP."
+    ),
+    "stock_returns": (
+        "Index: date — daily business days from 2020-01-02 to 2025-01-01 (~1 305 rows). "
+        "Columns: instrument_id (1 000 stocks). "
+        "Values: daily total return r_t = p_t/p_{t-1}−1 with GARCH-like vol clustering. "
+        "FREQUENCY: daily. To combine with position_history or factor_exposures (monthly effective_date), "
+        "forward-fill or asof-join on the date axis first."
+    ),
+    "position_history": (
+        "Index: MultiIndex (effective_date, instrument_id). "
+        "effective_date is monthly frequency — first business day of each month (~61 rebalance dates). "
+        "Columns: benchmark_weight, index_weight, mcap_usd; both weight columns sum exactly to 1.0 per effective_date. "
+        "FREQUENCY: monthly. To combine with stock_returns (daily date), "
+        "forward-fill weights to business-day frequency or asof-join on date before concatenating. "
+        "Can be merged directly with factor_exposures on (effective_date, instrument_id)."
+    ),
+    "factor_exposures": (
+        "Index: MultiIndex (effective_date, instrument_id). "
+        "effective_date is monthly frequency — first business day of each month, aligned with position_history. "
+        "Columns: factor — 'Value', 'Quality', 'Momentum', 'Low Vol', 'Size'; "
+        "approximately mean-zero, unit-variance cross-sectionally. "
+        "Can be merged directly with position_history on (effective_date, instrument_id). "
+        "FREQUENCY: monthly. Forward-fill to daily before joining with stock_returns."
+    ),
+    "user_signals": (
+        "Index: MultiIndex (ISIN, signal_date). "
+        "signal_date is weekly (every Wednesday), intentionally misaligned with both "
+        "monthly effective_date and daily date. "
+        "Columns: 'Proprietary 1', 'Proprietary 2' (AR(1) persistence across signal dates). "
+        "Join to other artefacts via ISIN. "
+        "FREQUENCY: weekly. Use asof-join or forward-fill to align with daily date or monthly effective_date."
+    ),
+}
+
+
+def make_registry() -> ArtefactRegistry:
+    """
+    Returns a pre-populated ArtefactRegistry containing all standard fixtures,
+    each registered with its full index/frequency/alignment description.
+
+    Use this instead of make_all_fixtures() when you need a ready-to-use registry
+    rather than raw DataFrames.
+    """
+    registry = ArtefactRegistry()
+    for name, data in make_all_fixtures().items():
+        registry.register(
+            name=name,
+            data=data,
+            description=_FIXTURE_DESCRIPTIONS[name],
+            provenance=Provenance.ENGINE,
+        )
+    return registry

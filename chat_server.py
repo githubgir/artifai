@@ -30,7 +30,7 @@ from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from artifact_registry import ArtefactRegistry, ExecutionResult, Provenance, run_analysis, ingest_file
-from fixtures import make_all_fixtures
+from fixtures import make_registry
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Session store (in-memory, single-user test server)
@@ -198,22 +198,16 @@ def get_manifest(session_id: str = "default"):
 @app.post("/api/load-test-data")
 def load_test_data(session_id: str = "default"):
     session = get_session(session_id)
-    fixtures = make_all_fixtures()
-    descriptions = {
-        "universe":         "Static universe: 1 000 stocks with stock_name, region, industry, ISIN, freefloat, SEDOL, CUSIP",
-        "stock_returns":    "Daily total return matrix: 5 years of business days × 1 000 instruments, GARCH-like vol clustering",
-        "position_history": "Monthly rebalancing weights (benchmark_weight, index_weight, mcap_usd) per instrument; weights sum to 1.0 per date",
-        "factor_exposures": "Factor loading matrix at monthly dates: Value, Quality, Momentum, Low Vol, Size",
-        "user_signals":     "Weekly proprietary signals per ISIN (Proprietary 1, Proprietary 2); dates misaligned with rebalancing dates",
-    }
-    for name, data in fixtures.items():
+    fixture_registry = make_registry()
+    for name in fixture_registry.names():
+        art = fixture_registry.get_artefact(name)
         session.registry.register(
-            name=name,
-            data=data,
-            description=descriptions[name],
-            provenance=Provenance.ENGINE,
+            name=art.name,
+            data=art.data,
+            description=art.description,
+            provenance=art.provenance,
         )
-    return {"message": f"Loaded {len(fixtures)} test artefacts", "manifest": session.registry.manifest()}
+    return {"message": f"Loaded {len(fixture_registry)} test artefacts", "manifest": session.registry.manifest()}
 
 
 @app.post("/api/chat")
