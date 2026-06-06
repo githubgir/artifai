@@ -30,7 +30,7 @@ from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from artifact_registry import ArtefactRegistry, ExecutionResult, Provenance, run_analysis, ingest_file
-from fixtures import make_all_fixtures
+from fixtures import make_registry
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Session store (in-memory, single-user test server)
@@ -198,51 +198,16 @@ def get_manifest(session_id: str = "default"):
 @app.post("/api/load-test-data")
 def load_test_data(session_id: str = "default"):
     session = get_session(session_id)
-    fixtures = make_all_fixtures()
-    descriptions = {
-        "universe": (
-            "Index: instrument_id (1 000 stocks, unique). "
-            "Columns: stock_name, region, industry, ISIN, freefloat, SEDOL, CUSIP. "
-            "Join to other artefacts on instrument_id, ISIN, SEDOL, or CUSIP."
-        ),
-        "stock_returns": (
-            "Index: date — daily business days from 2020-01-02 to 2025-01-01 (~1 305 rows). "
-            "Columns: instrument_id (1 000 stocks). "
-            "Values: daily total return r_t = p_t/p_{t-1}−1 with GARCH-like vol clustering. "
-            "FREQUENCY: daily. To combine with position_history or factor_exposures (monthly effective_date), "
-            "forward-fill or asof-join on the date axis first."
-        ),
-        "position_history": (
-            "Index: MultiIndex (effective_date, instrument_id). "
-            "effective_date is monthly frequency — first business day of each month (~61 rebalance dates). "
-            "Columns: benchmark_weight, index_weight, mcap_usd; both weight columns sum exactly to 1.0 per effective_date. "
-            "FREQUENCY: monthly. To combine with stock_returns (daily date), "
-            "forward-fill weights to business-day frequency or asof-join on date before concatenating."
-        ),
-        "factor_exposures": (
-            "Index: MultiIndex (effective_date, instrument_id). "
-            "effective_date is monthly frequency — first business day of each month, aligned with position_history. "
-            "Columns: factor — 'Value', 'Quality', 'Momentum', 'Low Vol', 'Size'; approximately mean-zero, unit-variance cross-sectionally. "
-            "Can be merged directly with position_history on (effective_date, instrument_id). "
-            "FREQUENCY: monthly. Forward-fill to daily before joining with stock_returns."
-        ),
-        "user_signals": (
-            "Index: MultiIndex (ISIN, signal_date). "
-            "signal_date is weekly (every Wednesday), intentionally misaligned with both "
-            "monthly effective_date and daily date. "
-            "Columns: 'Proprietary 1', 'Proprietary 2' (AR(1) persistence across signal dates). "
-            "Join to other artefacts via ISIN. "
-            "FREQUENCY: weekly. Use asof-join or forward-fill to align with daily date or monthly effective_date."
-        ),
-    }
-    for name, data in fixtures.items():
+    fixture_registry = make_registry()
+    for name in fixture_registry.names():
+        art = fixture_registry.get_artefact(name)
         session.registry.register(
-            name=name,
-            data=data,
-            description=descriptions[name],
-            provenance=Provenance.ENGINE,
+            name=art.name,
+            data=art.data,
+            description=art.description,
+            provenance=art.provenance,
         )
-    return {"message": f"Loaded {len(fixtures)} test artefacts", "manifest": session.registry.manifest()}
+    return {"message": f"Loaded {len(fixture_registry)} test artefacts", "manifest": session.registry.manifest()}
 
 
 @app.post("/api/chat")
