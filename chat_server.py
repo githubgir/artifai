@@ -168,6 +168,13 @@ def extract_requested_artefacts(code: str, available: list[str]) -> list[str]:
     return [name for name in available if name in code]
 
 
+def extract_code_block(text: str) -> str | None:
+    """Return the first fenced Python code block, if present."""
+    import re
+    match = re.search(r"```python\s*(.*?)```", text, re.DOTALL)
+    return match.group(1).strip() if match else None
+
+
 def serialise_artefact_data(data: Any, max_rows: int = 100) -> dict[str, Any]:
     """Return a JSON-friendly view of an artefact payload for API callers."""
     import numpy as np
@@ -472,6 +479,59 @@ def execute(body: dict):
     }
 
 
+@app.post("/api/retry")
+def retry_execution(body: dict):
+    session_id = body.get("session_id", "default")
+    code = body.get("code") or ""
+    error = body.get("error") or ""
+    session = get_session(session_id)
+
+    if not code:
+        return {"success": False, "error": "No code supplied for retry"}
+
+    prompt = (
+        "You are fixing a failed Python analysis script. "
+        "The previous attempt failed with the following error:\n"
+        f"{error}\n\n"
+        "Please rewrite the code to fix the error while keeping the same overall intent. "
+        "Return only the INTENT line and one ```python``` code block. "
+        "Use only pandas, numpy, and the named artefacts already available in the session. "
+        "Assign the final result to a variable named `result`.\n\n"
+        "Previous code:\n"
+        f"```python\n{code}\n```"
+    )
+
+    assistant_text = _llm_complete(
+        system=SYSTEM_PROMPT.format(manifest=session.registry.manifest()),
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=1500,
+    )
+    intent, new_code = parse_intent_and_code(assistant_text)
+
+    if not new_code:
+        return {"success": False, "error": "Retry model did not return any code"}
+
+    from artifact_registry import _ast_check
+    violations = _ast_check(new_code)
+    if violations:
+        return {"success": False, "error": "Retry code blocked: " + "; ".join(violations)}
+
+    pending_id = str(uuid.uuid4())
+    session.pending_results[pending_id] = {
+        "code": new_code,
+        "artefacts": extract_requested_artefacts(new_code, session.registry.names()),
+    }
+
+    return {
+        "success": True,
+        "text": assistant_text,
+        "intent": intent,
+        "has_code": True,
+        "pending_execution_id": pending_id,
+        "ast_error": None,
+    }
+
+
 @app.post("/api/register-derived")
 def register_derived(body: dict):
     session_id = body.get("session_id", "default")
@@ -677,6 +737,10 @@ function App() {
     setMessages([{ role: "assistant", id: "cleared", text: "Registry and history cleared." }]);
   };
 
+  const updateMessage = (id, patch) => {
+    setMessages(m => m.map(msg => (msg.id === id ? { ...msg, ...patch } : msg)));
+  };
+
   const handleSend = async () => {
     if (!input.trim() && !file) return;
     const userMsg = { role: "user", text: input + (file ? ` [📎 ${file.name}]` : ""), id: Date.now().toString() };
@@ -755,7 +819,8 @@ function App() {
         <div className="messages" ref={messagesRef}>
           {messages.map(msg => (
             <Message key={msg.id} msg={msg} sessionId={SESSION_ID}
-                     onExecuted={refreshManifest} onRegistered={refreshManifest} />
+                     onExecuted={refreshManifest} onRegistered={refreshManifest}
+                     onMessageUpdate={updateMessage} />
           ))}
           {loading && (
             <div className="message assistant">
@@ -798,13 +863,14 @@ function App() {
   );
 }
 
-function Message({ msg, sessionId, onExecuted, onRegistered }) {
+function Message({ msg, sessionId, onExecuted, onRegistered, onMessageUpdate }) {
   const [showCode, setShowCode] = useState(false);
   const [execResult, setExecResult] = useState(null);
   const [skipped, setSkipped] = useState(false);
   const [regName, setRegName] = useState("");
   const [regDesc, setRegDesc] = useState("");
   const [registered, setRegistered] = useState(false);
+  const [retrying, setRetrying] = useState(false);
 
   const extractCleanText = (text) => {
     return text
@@ -812,6 +878,13 @@ function Message({ msg, sessionId, onExecuted, onRegistered }) {
       .replace(/```python[\\s\\S]*?```/g, "")
       .trim();
   };
+
+  const cleanText = extractCleanText(msg.text);
+  const shownResult = execResult || msg.directResult;
+
+  useEffect(() => {
+    if (shownResult) setShowCode(true);
+  }, [shownResult]);
 
   const handleRun = async () => {
     const r = await fetch("/api/execute", {
@@ -822,11 +895,45 @@ function Message({ msg, sessionId, onExecuted, onRegistered }) {
     const d = await r.json();
     setExecResult(d);
     if (d.success) {
+      setShowCode(true);
       onExecuted();
       if (d.output_type === "dataframe" || d.output_type === "series") {
         setRegName("derived_" + Date.now().toString().slice(-4));
         setRegDesc(msg.intent || "Derived analysis result");
       }
+    }
+  };
+
+  const handleRetry = async () => {
+    const code = msg.text.match(/```python\\s*([\\s\\S]*?)```/)?.[1] || "";
+    if (!code) return;
+    setRetrying(true);
+    try {
+      const r = await fetch("/api/retry", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: sessionId,
+          code,
+          error: shownResult?.error || "",
+        }),
+      });
+      const d = await r.json();
+      if (d.success) {
+        onMessageUpdate(msg.id, {
+          text: d.text,
+          intent: d.intent,
+          pendingId: d.pending_execution_id,
+          astError: d.ast_error,
+          hasCode: d.has_code,
+          directResult: null,
+        });
+        setExecResult(null);
+        setShowCode(true);
+        setRegistered(false);
+      }
+    } finally {
+      setRetrying(false);
     }
   };
 
@@ -844,9 +951,6 @@ function Message({ msg, sessionId, onExecuted, onRegistered }) {
     const d = await r.json();
     if (d.success) { setRegistered(true); onRegistered(); }
   };
-
-  const cleanText = extractCleanText(msg.text);
-  const shownResult = execResult || msg.directResult;
 
   return (
     <div className={`message ${msg.role}`}>
@@ -925,6 +1029,11 @@ function Message({ msg, sessionId, onExecuted, onRegistered }) {
               <div className="error-block">
                 <div className="error-label">⚠ Execution Error</div>
                 <div className="error-text">{(shownResult.error || "").split("\\n").slice(-3).join("\\n")}</div>
+                {msg.pendingId && (
+                  <button className="btn-run" style={{marginTop:"8px"}} onClick={handleRetry} disabled={retrying}>
+                    {retrying ? "Retrying..." : "Retry"}
+                  </button>
+                )}
               </div>
             )}
           </div>

@@ -25,6 +25,8 @@ import time
 import pytest
 import requests
 
+import chat_server as chat_server_module
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Server fixture — starts chat_server.py as a subprocess for the test session
@@ -186,6 +188,30 @@ class TestExecuteCommand:
         # manifest is either a plain string like "(no artefacts registered)" or a list
         # Either way, "result" should not appear as a registered artefact name
         assert "result" not in str(manifest)
+
+
+class TestRetryFlow:
+    def test_retry_endpoint_generates_new_pending_code(self, monkeypatch):
+        session_id = "retry_unit_test"
+        chat_server_module.SESSIONS.pop(session_id, None)
+
+        def fake_llm_complete(*, system: str, messages: list[dict], max_tokens: int = 1500) -> str:
+            assert "division by zero" in messages[-1]["content"]
+            return "INTENT: Retry after error\n```python\nresult = 42\n```"
+
+        monkeypatch.setattr(chat_server_module, "_llm_complete", fake_llm_complete)
+
+        response = chat_server_module.retry_execution({
+            "session_id": session_id,
+            "code": "result = 1 / 0",
+            "error": "ZeroDivisionError: division by zero",
+        })
+
+        assert response["has_code"] is True
+        assert response["pending_execution_id"] is not None
+        assert response["intent"] == "Retry after error"
+        assert response["text"]
+        assert chat_server_module.get_session(session_id).pending_results[response["pending_execution_id"]]["code"] == "result = 42"
 
 
 class TestHealthAndManifest:
