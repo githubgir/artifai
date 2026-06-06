@@ -618,7 +618,7 @@ function App() {
     refreshManifest();
     setMessages(m => [...m, {
       role: "assistant", id: Date.now().toString(),
-      text: d.message + "\\n\\nYou can now ask me to analyse these datasets. Try: \"What does the return distribution look like for the top 10 stocks?\" or \"Join the latest benchmark weights to the universe metadata.\""
+      text: d.message + "\\n\\nYou can now ask me to analyse these datasets. Try: 'What does the return distribution look like for the top 10 stocks?' or 'Join the latest benchmark weights to the universe metadata.'"
     }]);
   };
 
