@@ -516,6 +516,7 @@ REACT_APP = """<!DOCTYPE html>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.development.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.development.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/recharts/2.12.7/Recharts.js"></script>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -878,6 +879,19 @@ function Message({ msg, sessionId, onExecuted, onRegistered }) {
           </div>
         )}
 
+        {shownResult && msg.pendingId && (
+          <div style={{marginBottom:"6px"}}>
+            <button className="code-toggle" onClick={() => setShowCode(s => !s)}>
+              {showCode ? "Hide code" : "Show code"}
+            </button>
+            {showCode && (
+              <div className="code-block">
+                {msg.text.match(/```python\\s*([\\s\\S]*?)```/)?.[1] || ""}
+              </div>
+            )}
+          </div>
+        )}
+
         {shownResult && (
           <div className="result-block">
             {shownResult.success ? (
@@ -920,6 +934,45 @@ function Message({ msg, sessionId, onExecuted, onRegistered }) {
   );
 }
 
+const CHART_COLORS = ["#58a6ff","#3fb950","#f78166","#d2a8ff","#ffa657","#79c0ff","#56d364","#ff7b72"];
+
+function DataframeLineChart({ preview }) {
+  const { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } = Recharts;
+  const cols = preview.columns;
+  // only chart numeric columns
+  const numericCols = cols.filter((_, ci) =>
+    preview.data.some(row => typeof row[ci] === "number" && !isNaN(row[ci]))
+  );
+  if (numericCols.length === 0) return null;
+
+  const chartData = preview.index.map((idx, i) => {
+    const point = { _index: String(idx) };
+    numericCols.forEach(col => {
+      const ci = cols.indexOf(col);
+      point[col] = preview.data[i][ci];
+    });
+    return point;
+  });
+
+  return (
+    <div style={{marginBottom:"8px"}}>
+      <ResponsiveContainer width="100%" height={220}>
+        <LineChart data={chartData} margin={{top:4,right:12,left:0,bottom:4}}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#30363d" />
+          <XAxis dataKey="_index" tick={{fill:"#7d8590",fontSize:11}} interval="preserveStartEnd" />
+          <YAxis tick={{fill:"#7d8590",fontSize:11}} width={50} />
+          <Tooltip contentStyle={{background:"#161b22",border:"1px solid #30363d",color:"#c9d1d9",fontSize:12}} />
+          {numericCols.length > 1 && <Legend wrapperStyle={{fontSize:11,color:"#c9d1d9"}} />}
+          {numericCols.map((col, i) => (
+            <Line key={col} type="monotone" dataKey={col} stroke={CHART_COLORS[i % CHART_COLORS.length]}
+                  dot={false} strokeWidth={2} />
+          ))}
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
 function ResultDisplay({ result }) {
   if (result.output_type === "scalar") {
     return <div className="result-scalar">{result.output_preview}</div>;
@@ -941,24 +994,27 @@ function ResultDisplay({ result }) {
     : preview.index.map((idx, i) => [idx, preview.values[i]]);
 
   return (
-    <div style={{overflowX:"auto",maxHeight:"200px",overflowY:"auto"}}>
-      <table className="result-table">
-        <thead>
-          <tr>{columns.map(c => <th key={c}>{c}</th>)}</tr>
-        </thead>
-        <tbody>
-          {rows.map((row, i) => (
-            <tr key={i}>{row.map((cell, j) => (
-              <td key={j}>{typeof cell === "number" ? cell.toFixed(4) : String(cell)}</td>
-            ))}</tr>
-          ))}
-        </tbody>
-      </table>
-      {(preview.shape?.[0] > 10 || preview.len > 10) && (
-        <div style={{fontSize:"11px",color:"#7d8590",padding:"4px 8px"}}>
-          Showing first 10 of {preview.shape?.[0] || preview.len} rows
-        </div>
-      )}
+    <div>
+      {result.output_type === "dataframe" && <DataframeLineChart preview={preview} />}
+      <div style={{overflowX:"auto",maxHeight:"200px",overflowY:"auto"}}>
+        <table className="result-table">
+          <thead>
+            <tr>{columns.map(c => <th key={c}>{c}</th>)}</tr>
+          </thead>
+          <tbody>
+            {rows.map((row, i) => (
+              <tr key={i}>{row.map((cell, j) => (
+                <td key={j}>{typeof cell === "number" ? cell.toFixed(4) : String(cell)}</td>
+              ))}</tr>
+            ))}
+          </tbody>
+        </table>
+        {(preview.shape?.[0] > 10 || preview.len > 10) && (
+          <div style={{fontSize:"11px",color:"#7d8590",padding:"4px 8px"}}>
+            Showing first 10 of {preview.shape?.[0] || preview.len} rows
+          </div>
+        )}
+      </div>
     </div>
   );
 }
