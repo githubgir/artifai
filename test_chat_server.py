@@ -50,7 +50,11 @@ def _wait_for_server(url: str, timeout: float = 15.0) -> bool:
 @pytest.fixture(scope="session")
 def server():
     """Start chat_server on a dedicated test port; yield base URL; stop after tests."""
-    env = {**os.environ, "ANTHROPIC_API_KEY": "test-key-not-needed-for-execute"}
+    env = {
+        **os.environ,
+        "ANTHROPIC_API_KEY": "test-key-not-needed-for-execute",
+        "OPENAI_API_KEY": "test-key-not-needed-for-execute",
+    }
     proc = subprocess.Popen(
         [sys.executable, "chat_server.py"],
         env={**env, "PORT": str(SERVER_PORT)},
@@ -246,12 +250,19 @@ browser_only = pytest.mark.skipif(
 )
 
 
+def _chromium_kwargs() -> dict:
+    """Return launch kwargs, using a pre-installed binary when available."""
+    import os
+    path = os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH")
+    return {"executable_path": path} if path else {}
+
+
 def _has_browser() -> bool:
     if not _PLAYWRIGHT_AVAILABLE:
         return False
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(headless=True, **_chromium_kwargs())
             browser.close()
             return True
     except Exception:
@@ -270,7 +281,7 @@ def browser_context(server):
     if not _BROWSER_AVAILABLE:
         pytest.skip("No browser")
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=True, **_chromium_kwargs())
         ctx = browser.new_context(base_url=server)
         yield ctx
         ctx.close()
@@ -279,7 +290,9 @@ def browser_context(server):
 
 @pytest.fixture
 def page(browser_context):
+    from conftest import setup_cdn_routes
     pg = browser_context.new_page()
+    setup_cdn_routes(pg)
     yield pg
     pg.close()
 
@@ -335,3 +348,45 @@ class TestBrowserExecuteUI:
         error_label = page.locator(".error-label").first
         error_label.wait_for(timeout=10_000)
         expect(error_label).to_contain_text("Blocked")
+
+
+@browser_ui
+class TestFixturesAndChart:
+    """Load fixtures then plot a time series and verify the chart renders."""
+
+    def test_load_fixtures_and_plot_first_instrument(self, page, server):
+        """
+        1. Load all fixture artefacts via the 'Load Test Data' button.
+        2. Run /execute to extract INST_0000's return series from stock_returns.
+        3. Verify the line chart (Recharts SVG) renders in the result.
+        """
+        page.goto(server)
+
+        # Step 1 — load fixtures
+        page.get_by_role("button", name="Load Test Data").click()
+        # Wait for stock_returns to appear in the manifest panel
+        page.locator(".manifest-panel .artefact-name", has_text="stock_returns").wait_for(timeout=20_000)
+
+        # Step 2 — run analysis via /execute
+        code = "result = stock_returns[['INST_0000']]"
+        page.locator(".msg-input").fill(f"/execute\n{code}")
+        page.locator(".send-btn").click()
+
+        # Step 3 — wait for result block
+        result_label = page.locator(".result-label").first
+        result_label.wait_for(timeout=20_000)
+        expect(result_label).to_contain_text("Result")
+        expect(result_label).to_contain_text("dataframe")
+
+        # Step 4 — verify the SVG line chart rendered
+        chart_svg = page.locator(".chart-wrap svg").first
+        chart_svg.wait_for(timeout=10_000)
+        expect(chart_svg).to_be_visible()
+
+        # At least one polyline should exist (one series = INST_0000)
+        line_path = page.locator(".chart-wrap polyline").first
+        expect(line_path).to_be_visible()
+
+        # The table should also render with the column name
+        headers = page.locator(".result-table th").all_text_contents()
+        assert "INST_0000" in headers

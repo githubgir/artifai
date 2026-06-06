@@ -516,7 +516,6 @@ REACT_APP = """<!DOCTYPE html>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.development.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.development.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/recharts/2.12.7/Recharts.js"></script>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -937,38 +936,116 @@ function Message({ msg, sessionId, onExecuted, onRegistered }) {
 const CHART_COLORS = ["#58a6ff","#3fb950","#f78166","#d2a8ff","#ffa657","#79c0ff","#56d364","#ff7b72"];
 
 function DataframeLineChart({ preview }) {
-  const { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } = Recharts;
   const cols = preview.columns;
-  // only chart numeric columns
   const numericCols = cols.filter((_, ci) =>
     preview.data.some(row => typeof row[ci] === "number" && !isNaN(row[ci]))
   );
   if (numericCols.length === 0) return null;
 
-  const chartData = preview.index.map((idx, i) => {
-    const point = { _index: String(idx) };
-    numericCols.forEach(col => {
-      const ci = cols.indexOf(col);
-      point[col] = preview.data[i][ci];
-    });
-    return point;
+  const W = 600, H = 180, PAD = { top: 8, right: 16, bottom: 28, left: 52 };
+  const innerW = W - PAD.left - PAD.right;
+  const innerH = H - PAD.top - PAD.bottom;
+  const n = preview.index.length;
+
+  // per-column min/max across all numeric series
+  const allVals = numericCols.flatMap((col) => {
+    const ci = cols.indexOf(col);
+    return preview.data.map(row => row[ci]).filter(v => typeof v === "number" && !isNaN(v));
   });
+  const yMin = Math.min(...allVals);
+  const yMax = Math.max(...allVals);
+  const yRange = yMax - yMin || 1;
+
+  const xScale = i => PAD.left + (i / Math.max(n - 1, 1)) * innerW;
+  const yScale = v => PAD.top + innerH - ((v - yMin) / yRange) * innerH;
+
+  // x-axis tick labels: show ~5 evenly spaced
+  const xTicks = [0, 0.25, 0.5, 0.75, 1].map(f => Math.round(f * (n - 1)));
+  // y-axis: 4 ticks
+  const yTicks = [0, 0.33, 0.67, 1].map(f => yMin + f * yRange);
+  const fmt = v => v.toFixed(Math.abs(v) < 0.01 ? 4 : 2);
+
+  const [tooltip, setTooltip] = React.useState(null);
+
+  const handleMouseMove = (e) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const svgX = (e.clientX - rect.left) * (W / rect.width) - PAD.left;
+    const idx = Math.round((svgX / innerW) * (n - 1));
+    if (idx >= 0 && idx < n) {
+      setTooltip({ idx, x: e.clientX - rect.left, y: e.clientY - rect.top });
+    }
+  };
 
   return (
-    <div style={{marginBottom:"8px"}}>
-      <ResponsiveContainer width="100%" height={220}>
-        <LineChart data={chartData} margin={{top:4,right:12,left:0,bottom:4}}>
-          <CartesianGrid strokeDasharray="3 3" stroke="#30363d" />
-          <XAxis dataKey="_index" tick={{fill:"#7d8590",fontSize:11}} interval="preserveStartEnd" />
-          <YAxis tick={{fill:"#7d8590",fontSize:11}} width={50} />
-          <Tooltip contentStyle={{background:"#161b22",border:"1px solid #30363d",color:"#c9d1d9",fontSize:12}} />
-          {numericCols.length > 1 && <Legend wrapperStyle={{fontSize:11,color:"#c9d1d9"}} />}
-          {numericCols.map((col, i) => (
-            <Line key={col} type="monotone" dataKey={col} stroke={CHART_COLORS[i % CHART_COLORS.length]}
-                  dot={false} strokeWidth={2} />
+    <div className="chart-wrap" style={{position:"relative",marginBottom:"8px"}}>
+      <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{display:"block",overflow:"visible"}}
+           onMouseMove={handleMouseMove} onMouseLeave={() => setTooltip(null)}>
+        {/* grid lines */}
+        {yTicks.map((v, i) => (
+          <line key={i} x1={PAD.left} x2={PAD.left + innerW}
+                y1={yScale(v)} y2={yScale(v)} stroke="#30363d" strokeDasharray="4 3" />
+        ))}
+        {/* y-axis labels */}
+        {yTicks.map((v, i) => (
+          <text key={i} x={PAD.left - 6} y={yScale(v) + 4} textAnchor="end"
+                fill="#7d8590" fontSize="10">{fmt(v)}</text>
+        ))}
+        {/* x-axis labels */}
+        {xTicks.map((idx) => (
+          <text key={idx} x={xScale(idx)} y={H - 6} textAnchor="middle"
+                fill="#7d8590" fontSize="10">
+            {String(preview.index[idx]).slice(0, 10)}
+          </text>
+        ))}
+        {/* series lines */}
+        {numericCols.map((col, ci) => {
+          const colIdx = cols.indexOf(col);
+          const pts = preview.data
+            .map((row, i) => [i, row[colIdx]])
+            .filter(([, v]) => typeof v === "number" && !isNaN(v))
+            .map(([i, v]) => `${xScale(i)},${yScale(v)}`)
+            .join(" ");
+          return <polyline key={col} points={pts} fill="none"
+                           stroke={CHART_COLORS[ci % CHART_COLORS.length]} strokeWidth="1.5" />;
+        })}
+        {/* hover crosshair */}
+        {tooltip && (
+          <line x1={xScale(tooltip.idx)} x2={xScale(tooltip.idx)}
+                y1={PAD.top} y2={PAD.top + innerH} stroke="#7d8590" strokeDasharray="3 2" />
+        )}
+      </svg>
+      {/* legend */}
+      {numericCols.length > 1 && (
+        <div style={{display:"flex",gap:"10px",flexWrap:"wrap",fontSize:"11px",color:"#c9d1d9",padding:"2px 0 4px"}}>
+          {numericCols.map((col, ci) => (
+            <span key={col}>
+              <span style={{display:"inline-block",width:"10px",height:"10px",
+                            background:CHART_COLORS[ci % CHART_COLORS.length],borderRadius:"2px",marginRight:"4px"}} />
+              {col}
+            </span>
           ))}
-        </LineChart>
-      </ResponsiveContainer>
+        </div>
+      )}
+      {/* tooltip */}
+      {tooltip && (() => {
+        const idx = tooltip.idx;
+        return (
+          <div style={{position:"absolute",left:tooltip.x+12,top:tooltip.y-10,
+                       background:"#161b22",border:"1px solid #30363d",borderRadius:"4px",
+                       padding:"4px 8px",fontSize:"11px",color:"#c9d1d9",pointerEvents:"none",zIndex:10}}>
+            <div style={{color:"#7d8590",marginBottom:"2px"}}>{String(preview.index[idx]).slice(0,10)}</div>
+            {numericCols.map((col, ci) => {
+              const v = preview.data[idx][cols.indexOf(col)];
+              return (
+                <div key={col}>
+                  <span style={{color:CHART_COLORS[ci % CHART_COLORS.length]}}>{col}: </span>
+                  {typeof v === "number" ? fmt(v) : String(v)}
+                </div>
+              );
+            })}
+          </div>
+        );
+      })()}
     </div>
   );
 }
