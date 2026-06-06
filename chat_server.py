@@ -878,6 +878,19 @@ function Message({ msg, sessionId, onExecuted, onRegistered }) {
           </div>
         )}
 
+        {shownResult && msg.pendingId && (
+          <div style={{marginBottom:"6px"}}>
+            <button className="code-toggle" onClick={() => setShowCode(s => !s)}>
+              {showCode ? "Hide code" : "Show code"}
+            </button>
+            {showCode && (
+              <div className="code-block">
+                {msg.text.match(/```python\\s*([\\s\\S]*?)```/)?.[1] || ""}
+              </div>
+            )}
+          </div>
+        )}
+
         {shownResult && (
           <div className="result-block">
             {shownResult.success ? (
