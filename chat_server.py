@@ -5,11 +5,17 @@ Test chat UI for the Artefact Registry.
 Single file: FastAPI backend + React SPA served inline.
 
 Usage:
-    pip install fastapi uvicorn anthropic pandas numpy openpyxl pyarrow python-multipart
-    export ANTHROPIC_API_KEY=sk-...
+    pip install fastapi uvicorn anthropic openai pandas numpy openpyxl pyarrow python-multipart
+    export ANTHROPIC_API_KEY=sk-ant-...   # for Anthropic (default)
+    # OR
+    export LLM_PROVIDER=openai
+    export OPENAI_API_KEY=sk-...          # for OpenAI
     python chat_server.py
 
 Then open http://localhost:8000
+
+Special chat commands:
+    /execute <python code>   — run code directly, bypassing the LLM
 """
 
 from __future__ import annotations
@@ -19,7 +25,6 @@ import os
 import uuid
 from typing import Any
 
-import anthropic
 import uvicorn
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -46,10 +51,58 @@ def get_session(session_id: str) -> Session:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LLM helpers
+# LLM provider setup — supports Anthropic (default) and OpenAI
+# Set LLM_PROVIDER=openai to use OpenAI; defaults to anthropic.
 # ─────────────────────────────────────────────────────────────────────────────
 
-client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "anthropic").lower()
+
+if LLM_PROVIDER == "openai":
+    import openai as _openai
+    _openai_client = _openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
+    _OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+else:
+    import anthropic as _anthropic
+    _anthropic_client = _anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+    _ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+
+
+def _llm_complete(*, system: str, messages: list[dict], max_tokens: int = 1500) -> str:
+    """Call the configured LLM and return the assistant text."""
+    if LLM_PROVIDER == "openai":
+        oai_messages = [{"role": "system", "content": system}] + messages
+        resp = _openai_client.chat.completions.create(
+            model=_OPENAI_MODEL,
+            max_tokens=max_tokens,
+            messages=oai_messages,
+        )
+        return resp.choices[0].message.content
+    else:
+        resp = _anthropic_client.messages.create(
+            model=_ANTHROPIC_MODEL,
+            max_tokens=max_tokens,
+            system=system,
+            messages=messages,
+        )
+        return resp.content[0].text
+
+
+def _llm_simple(*, prompt: str, max_tokens: int = 200) -> str:
+    """Call the LLM with a single user prompt (no system message)."""
+    if LLM_PROVIDER == "openai":
+        resp = _openai_client.chat.completions.create(
+            model=_OPENAI_MODEL,
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return resp.choices[0].message.content
+    else:
+        resp = _anthropic_client.messages.create(
+            model=_ANTHROPIC_MODEL,
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return resp.content[0].text
 
 SYSTEM_PROMPT = """You are an analytical assistant with access to a registry of tabular datasets.
 
@@ -81,22 +134,16 @@ After analysis runs, interpret the result for a non-technical user.
 
 def llm_describe_file(filename: str, df) -> str:
     """Call the LLM to describe an uploaded file."""
-    import pandas as pd
     sample = df.head(3).to_string()
     schema = df.dtypes.to_string()
-    msg = client.messages.create(
-        model="claude-sonnet-4-20250514",
+    return _llm_simple(
+        prompt=(
+            f"File: '{filename}'\nSchema:\n{schema}\nFirst 3 rows:\n{sample}\n\n"
+            "Describe in one plain-English sentence what this file contains "
+            "and what it could be used for in data analysis. No preamble."
+        ),
         max_tokens=100,
-        messages=[{
-            "role": "user",
-            "content": (
-                f"File: '{filename}'\nSchema:\n{schema}\nFirst 3 rows:\n{sample}\n\n"
-                "Describe in one plain-English sentence what this file contains "
-                "and what it could be used for in data analysis. No preamble."
-            )
-        }]
-    )
-    return msg.content[0].text.strip()
+    ).strip()
 
 
 def parse_intent_and_code(text: str) -> tuple[str | None, str | None]:
@@ -201,18 +248,93 @@ async def chat(
         except Exception as e:
             extra_context = f"\n[File upload failed: {e}]"
 
+    # ── /execute command — bypass LLM and run code directly ───────────────────
+    stripped = message.strip()
+    if stripped.startswith("/execute"):
+        raw_code = stripped[len("/execute"):].strip()
+        # Support optional ```python ... ``` fences
+        import re as _re
+        fence = _re.search(r"```(?:python)?\s*(.*?)```", raw_code, _re.DOTALL)
+        code = fence.group(1).strip() if fence else raw_code
+
+        from artifact_registry import _ast_check
+        violations = _ast_check(code)
+        if violations:
+            ast_error = "Code blocked: " + "; ".join(violations)
+            return {
+                "text": "Direct execution blocked.",
+                "intent": "/execute",
+                "has_code": True,
+                "pending_execution_id": None,
+                "ast_error": ast_error,
+                "manifest": session.registry.manifest(),
+            }
+
+        result: ExecutionResult = run_analysis(
+            code=code,
+            registry=session.registry,
+            requested_artefacts=extract_requested_artefacts(code, session.registry.names()),
+            timeout=30,
+        )
+
+        import pandas as pd
+        import numpy as np
+
+        output_preview = None
+        output_type = None
+        if result.success and result.output is not None:
+            if isinstance(result.output, pd.DataFrame):
+                output_type = "dataframe"
+                output_preview = {
+                    "columns": list(result.output.columns),
+                    "index": [str(i) for i in result.output.index[:10]],
+                    "data": result.output.head(10).values.tolist(),
+                    "shape": list(result.output.shape),
+                }
+            elif isinstance(result.output, pd.Series):
+                output_type = "series"
+                output_preview = {
+                    "name": result.output.name,
+                    "index": [str(i) for i in result.output.index[:10]],
+                    "values": result.output.head(10).tolist(),
+                    "len": len(result.output),
+                }
+            elif isinstance(result.output, np.ndarray):
+                output_type = "ndarray"
+                output_preview = {"shape": list(result.output.shape), "data": result.output.tolist()}
+            else:
+                output_type = "scalar"
+                output_preview = str(result.output)
+
+            exec_id = str(uuid.uuid4())
+            session.pending_results[exec_id] = {"code": code, "output": result.output,
+                                                  "artefacts": extract_requested_artefacts(code, session.registry.names())}
+        else:
+            exec_id = None
+
+        return {
+            "text": f"/execute ran {len(code.splitlines())} line(s) of code.",
+            "intent": "/execute",
+            "has_code": True,
+            "pending_execution_id": exec_id,
+            "ast_error": None,
+            "direct_result": {
+                "success": result.success,
+                "output_type": output_type,
+                "output_preview": output_preview,
+                "stdout": result.stdout,
+                "error": result.error,
+                "duration_ms": result.duration_ms,
+            },
+            "manifest": session.registry.manifest(),
+        }
+
     # ── Build messages ─────────────────────────────────────────────────────────
     system = SYSTEM_PROMPT.format(manifest=session.registry.manifest())
     session.history.append({"role": "user", "content": message + extra_context})
 
     # ── Call LLM ──────────────────────────────────────────────────────────────
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=1500,
-        system=system,
-        messages=session.history,
-    )
-    assistant_text = response.content[0].text
+    assistant_text = _llm_complete(system=system, messages=session.history, max_tokens=1500)
     session.history.append({"role": "assistant", "content": assistant_text})
 
     # ── Parse for code ────────────────────────────────────────────────────────
@@ -530,6 +652,7 @@ function App() {
         pendingId: d.pending_execution_id,
         astError: d.ast_error,
         hasCode: d.has_code,
+        directResult: d.direct_result || null,
       }]);
     } catch(e) {
       setMessages(m => [...m, { role: "assistant", id: Date.now().toString(), text: "Error: " + e.message }]);
@@ -674,6 +797,7 @@ function Message({ msg, sessionId, onExecuted, onRegistered }) {
   };
 
   const cleanText = extractCleanText(msg.text);
+  const shownResult = execResult || msg.directResult;
 
   return (
     <div className={`message ${msg.role}`}>
@@ -687,7 +811,7 @@ function Message({ msg, sessionId, onExecuted, onRegistered }) {
           </div>
         )}
 
-        {msg.pendingId && !skipped && !execResult && (
+        {msg.pendingId && !skipped && !execResult && !msg.directResult && (
           <div className="intent-card">
             <div className="intent-label">📊 Proposed Analysis</div>
             <div className="intent-text">{msg.intent || "Run analysis code"}</div>
@@ -706,20 +830,20 @@ function Message({ msg, sessionId, onExecuted, onRegistered }) {
           </div>
         )}
 
-        {execResult && (
+        {shownResult && (
           <div className="result-block">
-            {execResult.success ? (
+            {shownResult.success ? (
               <>
                 <div className="result-label">
-                  ✓ Result ({execResult.output_type}) — {execResult.duration_ms?.toFixed(0)}ms
+                  ✓ Result ({shownResult.output_type}) — {shownResult.duration_ms?.toFixed(0)}ms
                 </div>
-                <ResultDisplay result={execResult} />
-                {execResult.stdout && (
+                <ResultDisplay result={shownResult} />
+                {shownResult.stdout && (
                   <div style={{marginTop:"6px",fontSize:"12px",color:"#7d8590",fontFamily:"monospace"}}>
-                    stdout: {execResult.stdout}
+                    stdout: {shownResult.stdout}
                   </div>
                 )}
-                {(execResult.output_type === "dataframe" || execResult.output_type === "series") && !registered && (
+                {(shownResult.output_type === "dataframe" || shownResult.output_type === "series") && !registered && msg.pendingId && (
                   <div className="register-form">
                     <div className="register-label">💾 Save as artefact?</div>
                     <div className="register-inputs">
@@ -738,7 +862,7 @@ function Message({ msg, sessionId, onExecuted, onRegistered }) {
             ) : (
               <div className="error-block">
                 <div className="error-label">⚠ Execution Error</div>
-                <div className="error-text">{execResult.error.split("\\n").slice(-3).join("\\n")}</div>
+                <div className="error-text">{(shownResult.error || "").split("\\n").slice(-3).join("\\n")}</div>
               </div>
             )}
           </div>
@@ -804,5 +928,9 @@ ReactDOM.render(<App />, document.getElementById("root"));
 if __name__ == "__main__":
     print("Starting Artefact Registry Chat UI")
     print("Open: http://localhost:8000")
-    print("API key:", "✓ set" if os.environ.get("ANTHROPIC_API_KEY") else "✗ missing (set ANTHROPIC_API_KEY)")
+    print(f"LLM provider: {LLM_PROVIDER}")
+    if LLM_PROVIDER == "openai":
+        print("API key:", "✓ set" if os.environ.get("OPENAI_API_KEY") else "✗ missing (set OPENAI_API_KEY)")
+    else:
+        print("API key:", "✓ set" if os.environ.get("ANTHROPIC_API_KEY") else "✗ missing (set ANTHROPIC_API_KEY)")
     uvicorn.run(app, host="0.0.0.0", port=8000)
