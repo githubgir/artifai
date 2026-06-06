@@ -60,11 +60,11 @@ def server():
     )
     # chat_server hard-codes port 8000 when run as __main__; patch via monkeypatching
     # is not practical across processes, so we override via a helper below.
-    if not _wait_for_server(f"http://localhost:8000", timeout=15):
+    if not _wait_for_server(BASE_URL, timeout=15):
         proc.kill()
         out, err = proc.communicate()
         pytest.fail(f"Server failed to start.\nstdout: {out.decode()}\nstderr: {err.decode()}")
-    yield "http://localhost:8000"
+    yield BASE_URL
     proc.send_signal(signal.SIGTERM)
     proc.wait(timeout=5)
 

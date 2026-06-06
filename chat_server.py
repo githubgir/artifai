@@ -55,7 +55,7 @@ def get_session(session_id: str) -> Session:
 # Set LLM_PROVIDER=openai to use OpenAI; defaults to anthropic.
 # ─────────────────────────────────────────────────────────────────────────────
 
-LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "openai").lower()
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "anthropic").lower()
 
 if LLM_PROVIDER == "openai":
     import openai as _openai
@@ -927,10 +927,11 @@ ReactDOM.render(<App />, document.getElementById("root"));
 
 if __name__ == "__main__":
     print("Starting Artefact Registry Chat UI")
-    print("Open: http://localhost:8000")
+    port = int(os.environ.get("PORT", 8000))
+    print(f"Open: http://localhost:{port}")
     print(f"LLM provider: {LLM_PROVIDER}")
     if LLM_PROVIDER == "openai":
         print("API key:", "✓ set" if os.environ.get("OPENAI_API_KEY") else "✗ missing (set OPENAI_API_KEY)")
     else:
         print("API key:", "✓ set" if os.environ.get("ANTHROPIC_API_KEY") else "✗ missing (set ANTHROPIC_API_KEY)")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=port)
