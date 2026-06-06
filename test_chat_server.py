@@ -22,6 +22,7 @@ import subprocess
 import sys
 import time
 
+import pandas as pd
 import pytest
 import requests
 
@@ -180,6 +181,14 @@ class TestExecuteCommand:
         assert dr["success"] is True
         assert dr["output_preview"] == "99"
 
+    def test_execute_returns_code_for_widget(self, server):
+        """Direct /execute responses should include the code to render in the UI."""
+        code = "result = 7 + 5"
+        data = execute(server, code, session_id="test_code_field")
+
+        assert data["code"] == code
+        assert data["intent"] == "/execute"
+
     def test_manifest_unchanged_after_execute(self, server):
         """Running /execute does not automatically register artefacts."""
         code = "result = pd.DataFrame({'x': [1, 2]})"
@@ -188,6 +197,34 @@ class TestExecuteCommand:
         # manifest is either a plain string like "(no artefacts registered)" or a list
         # Either way, "result" should not appear as a registered artefact name
         assert "result" not in str(manifest)
+
+
+def test_execute_preview_is_not_truncated(monkeypatch):
+    """Execution previews should expose the full result, not only the first 10 rows."""
+    session_id = "truncate_preview"
+    chat_server_module.SESSIONS.pop(session_id, None)
+
+    class FakeResult:
+        success = True
+        output = pd.DataFrame({"value": list(range(12))})
+        stdout = ""
+        error = None
+        duration_ms = 1
+
+    monkeypatch.setattr(chat_server_module, "run_analysis", lambda **kwargs: FakeResult())
+
+    session = chat_server_module.get_session(session_id)
+    execution_id = "exec-1"
+    session.pending_results[execution_id] = {
+        "code": "result = pd.DataFrame({'value': list(range(12))})",
+        "artefacts": [],
+    }
+
+    response = chat_server_module.execute({"session_id": session_id, "execution_id": execution_id})
+
+    assert response["success"] is True
+    assert response["output_type"] == "dataframe"
+    assert len(response["output_preview"]["data"]) == 12
 
 
 class TestRetryFlow:

@@ -210,6 +210,33 @@ def serialise_artefact_data(data: Any, max_rows: int = 100) -> dict[str, Any]:
     return {"data_type": type(data).__name__.lower(), "data": data}
 
 
+def build_output_preview(output: Any) -> tuple[str | None, Any]:
+    """Build a JSON-friendly result preview without truncating tabular outputs."""
+    import numpy as np
+    import pandas as pd
+
+    if isinstance(output, pd.DataFrame):
+        return "dataframe", {
+            "columns": list(output.columns),
+            "index": [str(i) for i in output.index],
+            "data": output.to_dict(orient="records"),
+            "shape": list(output.shape),
+        }
+
+    if isinstance(output, pd.Series):
+        return "series", {
+            "name": output.name,
+            "index": [str(i) for i in output.index],
+            "values": output.tolist(),
+            "len": len(output),
+        }
+
+    if isinstance(output, np.ndarray):
+        return "ndarray", {"shape": list(output.shape), "data": output.tolist()}
+
+    return "scalar", str(output)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # FastAPI app
 # ─────────────────────────────────────────────────────────────────────────────
@@ -320,6 +347,7 @@ async def chat(
                 "text": "Direct execution blocked.",
                 "intent": "/execute",
                 "has_code": True,
+                "code": code,
                 "pending_execution_id": None,
                 "ast_error": ast_error,
                 "manifest": session.registry.manifest(),
@@ -332,34 +360,10 @@ async def chat(
             timeout=30,
         )
 
-        import pandas as pd
-        import numpy as np
-
         output_preview = None
         output_type = None
         if result.success and result.output is not None:
-            if isinstance(result.output, pd.DataFrame):
-                output_type = "dataframe"
-                output_preview = {
-                    "columns": list(result.output.columns),
-                    "index": [str(i) for i in result.output.index[:10]],
-                    "data": result.output.head(10).values.tolist(),
-                    "shape": list(result.output.shape),
-                }
-            elif isinstance(result.output, pd.Series):
-                output_type = "series"
-                output_preview = {
-                    "name": result.output.name,
-                    "index": [str(i) for i in result.output.index[:10]],
-                    "values": result.output.head(10).tolist(),
-                    "len": len(result.output),
-                }
-            elif isinstance(result.output, np.ndarray):
-                output_type = "ndarray"
-                output_preview = {"shape": list(result.output.shape), "data": result.output.tolist()}
-            else:
-                output_type = "scalar"
-                output_preview = str(result.output)
+            output_type, output_preview = build_output_preview(result.output)
 
             exec_id = str(uuid.uuid4())
             session.pending_results[exec_id] = {"code": code, "output": result.output,
@@ -371,6 +375,7 @@ async def chat(
             "text": f"/execute ran {len(code.splitlines())} line(s) of code.",
             "intent": "/execute",
             "has_code": True,
+            "code": code,
             "pending_execution_id": exec_id,
             "ast_error": None,
             "direct_result": {
@@ -414,6 +419,7 @@ async def chat(
         "text": assistant_text,
         "intent": intent,
         "has_code": code is not None,
+        "code": code,
         "pending_execution_id": pending_id,
         "ast_error": ast_error,
         "manifest": session.registry.manifest(),
@@ -439,32 +445,9 @@ def execute(body: dict):
 
     output_preview = None
     output_type = None
-    import pandas as pd
-    import numpy as np
 
     if result.success and result.output is not None:
-        if isinstance(result.output, pd.DataFrame):
-            output_type = "dataframe"
-            output_preview = {
-                "columns": list(result.output.columns),
-                "index": [str(i) for i in result.output.index[:10]],
-                "data": result.output.head(10).values.tolist(),
-                "shape": list(result.output.shape),
-            }
-        elif isinstance(result.output, pd.Series):
-            output_type = "series"
-            output_preview = {
-                "name": result.output.name,
-                "index": [str(i) for i in result.output.index[:10]],
-                "values": result.output.head(10).tolist(),
-                "len": len(result.output),
-            }
-        elif isinstance(result.output, np.ndarray):
-            output_type = "ndarray"
-            output_preview = {"shape": list(result.output.shape), "data": result.output.tolist()}
-        else:
-            output_type = "scalar"
-            output_preview = str(result.output)
+        output_type, output_preview = build_output_preview(result.output)
 
         # Store output for potential registration
         session.pending_results[execution_id]["output"] = result.output
@@ -575,8 +558,9 @@ REACT_APP = """<!DOCTYPE html>
 <title>Artefact Registry Chat</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.development.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.development.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prop-types/15.8.1/prop-types.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/recharts/2.12.7/Recharts.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -762,6 +746,7 @@ function App() {
         role: "assistant", id: Date.now().toString(),
         text: d.text,
         intent: d.intent,
+        code: d.code || null,
         pendingId: d.pending_execution_id,
         astError: d.ast_error,
         hasCode: d.has_code,
@@ -879,6 +864,7 @@ function Message({ msg, sessionId, onExecuted, onRegistered, onMessageUpdate }) 
       .trim();
   };
 
+  const codeText = msg.code || (msg.text.match(/```python\\s*([\\s\\S]*?)```/)?.[1] || "");
   const cleanText = extractCleanText(msg.text);
   const shownResult = execResult || msg.directResult;
 
@@ -905,7 +891,7 @@ function Message({ msg, sessionId, onExecuted, onRegistered, onMessageUpdate }) 
   };
 
   const handleRetry = async () => {
-    const code = msg.text.match(/```python\\s*([\\s\\S]*?)```/)?.[1] || "";
+    const code = codeText;
     if (!code) return;
     setRetrying(true);
     try {
@@ -923,6 +909,7 @@ function Message({ msg, sessionId, onExecuted, onRegistered, onMessageUpdate }) 
         onMessageUpdate(msg.id, {
           text: d.text,
           intent: d.intent,
+          code: d.code || codeText,
           pendingId: d.pending_execution_id,
           astError: d.ast_error,
           hasCode: d.has_code,
@@ -976,9 +963,7 @@ function Message({ msg, sessionId, onExecuted, onRegistered, onMessageUpdate }) 
               </button>
             </div>
             {showCode && (
-              <div className="code-block">
-                {msg.text.match(/```python\\s*([\\s\\S]*?)```/)?.[1] || ""}
-              </div>
+              <div className="code-block">{codeText}</div>
             )}
           </div>
         )}
@@ -989,9 +974,7 @@ function Message({ msg, sessionId, onExecuted, onRegistered, onMessageUpdate }) 
               {showCode ? "Hide code" : "Show code"}
             </button>
             {showCode && (
-              <div className="code-block">
-                {msg.text.match(/```python\\s*([\\s\\S]*?)```/)?.[1] || ""}
-              </div>
+              <div className="code-block">{codeText}</div>
             )}
           </div>
         )}
