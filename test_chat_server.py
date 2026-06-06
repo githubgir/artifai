@@ -191,6 +191,33 @@ class TestExecuteCommand:
 class TestHealthAndManifest:
     """Basic sanity checks for the server."""
 
+    def test_artefact_detail_returns_description_and_data(self, server):
+        r = requests.post(f"{server}/api/load-test-data?session_id=api_detail", timeout=30)
+        assert r.status_code == 200
+
+        detail = requests.get(
+            f"{server}/api/artefact/universe?session_id=api_detail",
+            timeout=30,
+        )
+        assert detail.status_code == 200
+
+        body = detail.json()
+        assert body["name"] == "universe"
+        assert body["provenance"] == "engine"
+        assert "stock_name" in body["description"] or "Static universe" in body["description"]
+        assert body["data_type"] == "dataframe"
+        assert isinstance(body["data"], list)
+        assert len(body["data"]) >= 1
+        assert "instrument_id" in body["data"][0]
+
+    def test_manifest_lists_registered_artefacts(self, server):
+        requests.post(f"{server}/api/load-test-data?session_id=api_manifest", timeout=30)
+        r = requests.get(f"{server}/api/manifest?session_id=api_manifest", timeout=30)
+        assert r.status_code == 200
+        body = r.json()
+        assert any(item["name"] == "universe" for item in body["artefacts"])
+        assert "Static universe" in body["manifest"]
+
     def test_server_responds(self, server):
         r = requests.get(server, timeout=5)
         assert r.status_code == 200
