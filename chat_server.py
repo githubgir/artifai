@@ -168,6 +168,41 @@ def extract_requested_artefacts(code: str, available: list[str]) -> list[str]:
     return [name for name in available if name in code]
 
 
+def serialise_artefact_data(data: Any, max_rows: int = 100) -> dict[str, Any]:
+    """Return a JSON-friendly view of an artefact payload for API callers."""
+    import numpy as np
+    import pandas as pd
+
+    if isinstance(data, pd.DataFrame):
+        preview = data.head(max_rows).to_dict(orient="records")
+        return {
+            "data_type": "dataframe",
+            "data": preview,
+            "columns": list(data.columns),
+            "shape": [int(data.shape[0]), int(data.shape[1])],
+            "preview_rows": len(preview),
+            "truncated": len(data) > max_rows,
+        }
+    if isinstance(data, pd.Series):
+        preview = data.head(max_rows).tolist()
+        return {
+            "data_type": "series",
+            "data": preview,
+            "name": data.name,
+            "length": int(len(data)),
+            "preview_rows": len(preview),
+            "truncated": len(data) > max_rows,
+        }
+    if isinstance(data, np.ndarray):
+        return {
+            "data_type": "ndarray",
+            "data": data.tolist(),
+            "shape": list(data.shape),
+        }
+
+    return {"data_type": type(data).__name__.lower(), "data": data}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # FastAPI app
 # ─────────────────────────────────────────────────────────────────────────────
@@ -193,6 +228,25 @@ def get_manifest(session_id: str = "default"):
             "parents": art.parent_artefacts,
         })
     return {"artefacts": artefacts, "manifest": session.registry.manifest()}
+
+
+@app.get("/api/artefact/{name}")
+def get_artefact(name: str, session_id: str = "default"):
+    session = get_session(session_id)
+    try:
+        art = session.registry.get_artefact(name)
+    except KeyError as exc:
+        return JSONResponse(status_code=404, content={"error": str(exc)})
+
+    return {
+        "name": art.name,
+        "provenance": art.provenance.value,
+        "description": art.description,
+        "dtype_summary": art.dtype_summary,
+        "parents": art.parent_artefacts,
+        "created_at": art.created_at.isoformat(),
+        **serialise_artefact_data(art.data),
+    }
 
 
 @app.post("/api/load-test-data")

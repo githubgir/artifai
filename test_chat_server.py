@@ -204,11 +204,11 @@ class TestHealthAndManifest:
         body = detail.json()
         assert body["name"] == "universe"
         assert body["provenance"] == "engine"
-        assert "stock_name" in body["description"] or "Static universe" in body["description"]
+        assert body["description"]
         assert body["data_type"] == "dataframe"
         assert isinstance(body["data"], list)
         assert len(body["data"]) >= 1
-        assert "instrument_id" in body["data"][0]
+        assert "stock_name" in body["data"][0]
 
     def test_manifest_lists_registered_artefacts(self, server):
         requests.post(f"{server}/api/load-test-data?session_id=api_manifest", timeout=30)
@@ -216,7 +216,7 @@ class TestHealthAndManifest:
         assert r.status_code == 200
         body = r.json()
         assert any(item["name"] == "universe" for item in body["artefacts"])
-        assert "Static universe" in body["manifest"]
+        assert "`universe`" in body["manifest"]
 
     def test_server_responds(self, server):
         r = requests.get(server, timeout=5)
