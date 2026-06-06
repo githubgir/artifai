@@ -271,13 +271,15 @@ def ingest_file(
 
 ### 9.1 Synthetic Test Data
 
-The test suite shall include a `fixtures.py` module that generates reproducible synthetic datasets without any external dependencies:
+The test suite shall include a `fixtures.py` module that generates reproducible synthetic datasets without any external dependencies. All fixtures share consistent `instrument_id`, `ISIN`, `SEDOL`, and `CUSIP` identifiers so they can be joined without key engineering.
 
-- `make_returns_series(n=1000)` — daily return series with realistic vol clustering
-- `make_position_history(n_dates=500, n_assets=50)` — weight matrix summing to 1.0 per row
-- `make_factor_exposures(n_dates=500, n_factors=5)` — factor loading matrix
-- `make_external_benchmark(n=1000)` — independent return series for join/compare tests
-- `make_universe_file()` — DataFrame with ISIN-like IDs and numeric attributes, for file upload tests
+| Function | Returns | Index | Columns |
+|---|---|---|---|
+| `make_stock_returns_series()` | `DataFrame` | `date` — 5 years of business days (~1 305 rows) | `instrument_id` — 1 000 stocks; values are daily total return r_t = p_t/p_{t-1}−1 with GARCH-like vol clustering |
+| `make_position_history()` | `DataFrame` | `(effective_date, instrument_id)` — MultiIndex; effective dates are monthly rebalancing dates | `benchmark_weight`, `index_weight`, `mcap_usd`; both weight columns sum to 1.0 for every `effective_date` |
+| `make_factor_exposures()` | `DataFrame` | `(effective_date, instrument_id)` — MultiIndex | `factor_id` — "Value", "Quality", "Momentum", "Low Vol", "Size"; approximately mean-zero, unit-variance cross-sectionally |
+| `make_user_signals()` | `DataFrame` | `(ISIN, signal_date)` — MultiIndex; `signal_date` is weekly (Wednesdays), intentionally misaligned with `effective_date` | "Proprietary 1", "Proprietary 2" |
+| `make_universe_file()` | `DataFrame` | `instrument_id` | `stock_name`, `region`, `industry`, `ISIN`, `freefloat`, `SEDOL`, `CUSIP` |
 
 All fixtures shall use a fixed random seed for reproducibility.
 
