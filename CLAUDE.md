@@ -12,9 +12,8 @@ uv run python chat_server.py                   # start the chat UI at http://loc
 ```
 
 Environment variables for the server:
-- `ANTHROPIC_API_KEY` — required for the default Anthropic provider
-- `LLM_PROVIDER=openai` + `OPENAI_API_KEY` — to switch to OpenAI
-- `ANTHROPIC_MODEL` / `OPENAI_MODEL` — override the model (defaults: `claude-sonnet-4-20250514` / `gpt-4o-mini`)
+- `OPENAI_API_KEY` — required
+- `OPENAI_MODEL` — override the model (default: `gpt-4o-mini`)
 
 ## Architecture
 
@@ -29,7 +28,7 @@ No FastAPI, no LLM calls — pure pandas/numpy. Three public entry points:
 ### Server (`chat_server.py`)
 FastAPI app with an in-memory `Session` store (registry + chat history + pending execution results). Key flow:
 
-1. `POST /api/chat` — appends to session history, calls `_llm_complete()`, parses `INTENT:` + ` ```python` block from the response, AST-checks the code, stores it under a UUID in `session.pending_results`, and returns the UUID to the client without running anything yet.
+1. `POST /api/chat` — appends to session history, calls `_llm_chat()` with the `run_analysis` tool, stores the pending code under a UUID in `session.pending_results`, and returns the UUID to the client without running anything yet.
 2. `POST /api/execute` — looks up the pending UUID and actually calls `run_analysis()`. Kept separate so the user can inspect/skip code before it runs.
 3. `POST /api/register-derived` — promotes the output of a successful execution into the registry as a `DERIVED` artefact, with the source artefact names recorded as parents.
 

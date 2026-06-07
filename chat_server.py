@@ -5,11 +5,8 @@ Test chat UI for the Artefact Registry.
 Single file: FastAPI backend + React SPA served inline.
 
 Usage:
-    pip install fastapi uvicorn anthropic openai pandas numpy openpyxl pyarrow python-multipart
-    export ANTHROPIC_API_KEY=sk-ant-...   # for Anthropic (default)
-    # OR
-    export LLM_PROVIDER=openai
-    export OPENAI_API_KEY=sk-...          # for OpenAI
+    pip install fastapi uvicorn openai pandas numpy openpyxl pyarrow python-multipart
+    export OPENAI_API_KEY=sk-...
     python chat_server.py
 
 Then open http://localhost:8000
@@ -51,58 +48,39 @@ def get_session(session_id: str) -> Session:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LLM provider setup — supports Anthropic (default) and OpenAI
-# Set LLM_PROVIDER=openai to use OpenAI; defaults to anthropic.
+# LLM setup — OpenAI
 # ─────────────────────────────────────────────────────────────────────────────
 
-LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "anthropic").lower()
+import openai as _openai
+_OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+_openai_client: "_openai.OpenAI | None" = None
 
-if LLM_PROVIDER == "openai":
-    import openai as _openai
-    _openai_client = _openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY") or "")
-    _OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
-else:
-    import anthropic as _anthropic
-    _anthropic_client = _anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY") or "")
-    _ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+def _get_client() -> "_openai.OpenAI":
+    global _openai_client
+    if _openai_client is None:
+        _openai_client = _openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY") or "")
+    return _openai_client
 
 
 def _llm_complete(*, system: str, messages: list[dict], max_tokens: int = 1500) -> str:
-    """Call the configured LLM and return the assistant text (no tools)."""
-    if LLM_PROVIDER == "openai":
-        oai_messages = [{"role": "system", "content": system}] + messages
-        resp = _openai_client.chat.completions.create(
-            model=_OPENAI_MODEL,
-            max_tokens=max_tokens,
-            messages=oai_messages,
-        )
-        return resp.choices[0].message.content or ""
-    else:
-        resp = _anthropic_client.messages.create(
-            model=_ANTHROPIC_MODEL,
-            max_tokens=max_tokens,
-            system=system,
-            messages=messages,
-        )
-        return next((b.text for b in resp.content if hasattr(b, "text")), "")
+    """Call the LLM and return the assistant text (no tools)."""
+    oai_messages = [{"role": "system", "content": system}] + messages
+    resp = _get_client().chat.completions.create(
+        model=_OPENAI_MODEL,
+        max_tokens=max_tokens,
+        messages=oai_messages,
+    )
+    return resp.choices[0].message.content or ""
 
 
 def _llm_simple(*, prompt: str, max_tokens: int = 200) -> str:
     """Call the LLM with a single user prompt (no system message)."""
-    if LLM_PROVIDER == "openai":
-        resp = _openai_client.chat.completions.create(
-            model=_OPENAI_MODEL,
-            max_tokens=max_tokens,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return resp.choices[0].message.content
-    else:
-        resp = _anthropic_client.messages.create(
-            model=_ANTHROPIC_MODEL,
-            max_tokens=max_tokens,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return resp.content[0].text
+    resp = _get_client().chat.completions.create(
+        model=_OPENAI_MODEL,
+        max_tokens=max_tokens,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return resp.choices[0].message.content or ""
 
 SYSTEM_PROMPT = """You are an analytical assistant with access to a registry of tabular datasets.
 
@@ -132,20 +110,7 @@ _TOOL_DESCRIPTION = (
     "Assign the final result to a variable named `result`."
 )
 
-_ANTHROPIC_TOOL: dict = {
-    "name": "run_analysis",
-    "description": _TOOL_DESCRIPTION,
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "intent": {"type": "string", "description": "One-sentence plain-English description of what this code does."},
-            "code":   {"type": "string", "description": "Python code to execute. Must assign output to `result`. No imports."},
-        },
-        "required": ["intent", "code"],
-    },
-}
-
-_OPENAI_TOOL: dict = {
+_ANALYSIS_TOOL: dict = {
     "type": "function",
     "function": {
         "name": "run_analysis",
@@ -172,62 +137,36 @@ def _llm_chat(
       - Conversational reply : (text, None, None, None)
       - Tool call            : (None, intent, code, tool_id)
     """
-    if LLM_PROVIDER == "openai":
-        oai_messages = [{"role": "system", "content": system}] + messages
-        resp = _openai_client.chat.completions.create(
-            model=_OPENAI_MODEL,
-            max_tokens=max_tokens,
-            messages=oai_messages,
-            tools=[_OPENAI_TOOL],
-            tool_choice="auto",
-        )
-        choice = resp.choices[0]
-        if choice.finish_reason == "tool_calls":
-            tc = choice.message.tool_calls[0]
-            args = json.loads(tc.function.arguments)
-            return None, args.get("intent", ""), args.get("code", ""), tc.id
-        return choice.message.content or "", None, None, None
-    else:
-        resp = _anthropic_client.messages.create(
-            model=_ANTHROPIC_MODEL,
-            max_tokens=max_tokens,
-            system=system,
-            messages=messages,
-            tools=[_ANTHROPIC_TOOL],
-        )
-        if resp.stop_reason == "tool_use":
-            tb = next(b for b in resp.content if b.type == "tool_use")
-            return None, tb.input.get("intent", ""), tb.input.get("code", ""), tb.id
-        text = next((b.text for b in resp.content if hasattr(b, "text")), "")
-        return text, None, None, None
+    oai_messages = [{"role": "system", "content": system}] + messages
+    resp = _get_client().chat.completions.create(
+        model=_OPENAI_MODEL,
+        max_tokens=max_tokens,
+        messages=oai_messages,
+        tools=[_ANALYSIS_TOOL],
+        tool_choice="auto",
+    )
+    choice = resp.choices[0]
+    if choice.finish_reason == "tool_calls":
+        tc = choice.message.tool_calls[0]
+        args = json.loads(tc.function.arguments)
+        return None, args.get("intent", ""), args.get("code", ""), tc.id
+    return choice.message.content or "", None, None, None
 
 
 def _append_tool_call(history: list[dict], tool_id: str, intent: str, code: str) -> None:
-    """Append provider-native assistant tool-call message to history."""
-    if LLM_PROVIDER == "openai":
-        history.append({
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [{"id": tool_id, "type": "function",
-                            "function": {"name": "run_analysis",
-                                         "arguments": json.dumps({"intent": intent, "code": code})}}],
-        })
-    else:
-        history.append({
-            "role": "assistant",
-            "content": [{"type": "tool_use", "id": tool_id,
-                         "name": "run_analysis", "input": {"intent": intent, "code": code}}],
-        })
+    """Append assistant tool-call message to history."""
+    history.append({
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{"id": tool_id, "type": "function",
+                        "function": {"name": "run_analysis",
+                                     "arguments": json.dumps({"intent": intent, "code": code})}}],
+    })
 
 
 def _append_tool_result(history: list[dict], tool_id: str, result_text: str) -> None:
-    """Append provider-native tool result to history."""
-    if LLM_PROVIDER == "openai":
-        history.append({"role": "tool", "tool_call_id": tool_id, "content": result_text})
-    else:
-        history.append({"role": "user", "content": [{"type": "tool_result",
-                                                       "tool_use_id": tool_id,
-                                                       "content": result_text}]})
+    """Append tool result to history."""
+    history.append({"role": "tool", "tool_call_id": tool_id, "content": result_text})
 
 
 def _maybe_close_pending_tool(history: list[dict]) -> None:
@@ -239,21 +178,10 @@ def _maybe_close_pending_tool(history: list[dict]) -> None:
     if not history:
         return
     last = history[-1]
-    if LLM_PROVIDER == "openai":
-        if last.get("role") == "assistant" and last.get("tool_calls"):
-            for tc in last["tool_calls"]:
-                history.append({"role": "tool", "tool_call_id": tc["id"],
-                                 "content": "User skipped this execution."})
-    else:
-        content = last.get("content")
-        if last.get("role") == "assistant" and isinstance(content, list):
-            tool_uses = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_use"]
-            if tool_uses:
-                history.append({"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": b["id"],
-                     "content": "User skipped this execution."}
-                    for b in tool_uses
-                ]})
+    if last.get("role") == "assistant" and last.get("tool_calls"):
+        for tc in last["tool_calls"]:
+            history.append({"role": "tool", "tool_call_id": tc["id"],
+                             "content": "User skipped this execution."})
 
 
 def _format_result_for_llm(result: "ExecutionResult", output_type: str | None, output_preview: Any) -> str:
@@ -1308,9 +1236,6 @@ ReactDOM.render(<App />, document.getElementById("root"));
 if __name__ == "__main__":
     print("Starting Artefact Registry Chat UI")
     print("Open: http://localhost:8000")
-    print(f"LLM provider: {LLM_PROVIDER}")
-    if LLM_PROVIDER == "openai":
-        print("API key:", "✓ set" if os.environ.get("OPENAI_API_KEY") else "✗ missing (set OPENAI_API_KEY)")
-    else:
-        print("API key:", "✓ set" if os.environ.get("ANTHROPIC_API_KEY") else "✗ missing (set ANTHROPIC_API_KEY)")
+    print(f"Model: {_OPENAI_MODEL}")
+    print("API key:", "✓ set" if os.environ.get("OPENAI_API_KEY") else "✗ missing (set OPENAI_API_KEY)")
     uvicorn.run(app, host="0.0.0.0", port=8000)

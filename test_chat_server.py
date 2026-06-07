@@ -52,7 +52,7 @@ def _wait_for_server(url: str, timeout: float = 15.0) -> bool:
 @pytest.fixture(scope="session")
 def server():
     """Start chat_server on a dedicated test port; yield base URL; stop after tests."""
-    env = {**os.environ, "ANTHROPIC_API_KEY": "test-key-not-needed-for-execute"}
+    env = {**os.environ, "OPENAI_API_KEY": os.environ.get("OPENAI_API_KEY", "test-key-not-needed-for-execute")}
     proc = subprocess.Popen(
         [sys.executable, "chat_server.py"],
         env={**env, "PORT": str(SERVER_PORT)},
