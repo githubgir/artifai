@@ -693,11 +693,11 @@ function App() {
   const fileRef = useRef();
   const messagesRef = useRef();
 
-  const refreshManifest = async () => {
+  const refreshManifest = useCallback(async () => {
     const r = await fetch(`/api/manifest?session_id=${SESSION_ID}`);
     const d = await r.json();
     setArtefacts(d.artefacts);
-  };
+  }, []);
 
   useEffect(() => { refreshManifest(); }, []);
   useEffect(() => {
@@ -705,7 +705,7 @@ function App() {
       messagesRef.current.scrollTop = messagesRef.current.scrollHeight;
   }, [messages]);
 
-  const loadTestData = async () => {
+  const loadTestData = useCallback(async () => {
     const r = await fetch(`/api/load-test-data?session_id=${SESSION_ID}`, { method: "POST" });
     const d = await r.json();
     refreshManifest();
@@ -713,19 +713,19 @@ function App() {
       role: "assistant", id: Date.now().toString(),
       text: d.message + "\\n\\nYou can now ask me to analyse these datasets. Try: 'What does the return distribution look like for the top 10 stocks?' or 'Join the latest benchmark weights to the universe metadata.'"
     }]);
-  };
+  }, [refreshManifest]);
 
-  const clearAll = async () => {
+  const clearAll = useCallback(async () => {
     await fetch(`/api/registry?session_id=${SESSION_ID}`, { method: "DELETE" });
     setArtefacts([]);
     setMessages([{ role: "assistant", id: "cleared", text: "Registry and history cleared." }]);
-  };
+  }, []);
 
-  const updateMessage = (id, patch) => {
+  const updateMessage = useCallback((id, patch) => {
     setMessages(m => m.map(msg => (msg.id === id ? { ...msg, ...patch } : msg)));
-  };
+  }, []);
 
-  const handleSend = async () => {
+  const handleSend = useCallback(async () => {
     if (!input.trim() && !file) return;
     const userMsg = { role: "user", text: input + (file ? ` [📎 ${file.name}]` : ""), id: Date.now().toString() };
     setMessages(m => [...m, userMsg]);
@@ -756,19 +756,19 @@ function App() {
       setMessages(m => [...m, { role: "assistant", id: Date.now().toString(), text: "Error: " + e.message }]);
     }
     setLoading(false);
-  };
+  }, [input, file, refreshManifest]);
 
-  const handleKeyDown = (e) => {
+  const handleKeyDown = useCallback((e) => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSend(); }
-  };
+  }, [handleSend]);
 
-  const handleFile = (e) => {
+  const handleFile = useCallback((e) => {
     const f = e.target.files[0];
     if (!f) return;
     const reader = new FileReader();
     reader.onload = ev => setFile({ name: f.name, bytes: ev.target.result });
     reader.readAsArrayBuffer(f);
-  };
+  }, []);
 
   return (
     <div className="app">
@@ -848,7 +848,7 @@ function App() {
   );
 }
 
-function Message({ msg, sessionId, onExecuted, onRegistered, onMessageUpdate }) {
+const Message = React.memo(function Message({ msg, sessionId, onExecuted, onRegistered, onMessageUpdate }) {
   const [showCode, setShowCode] = useState(false);
   const [execResult, setExecResult] = useState(null);
   const [skipped, setSkipped] = useState(false);
@@ -872,7 +872,7 @@ function Message({ msg, sessionId, onExecuted, onRegistered, onMessageUpdate }) 
     if (shownResult) setShowCode(true);
   }, [shownResult]);
 
-  const handleRun = async () => {
+  const handleRun = useCallback(async () => {
     const r = await fetch("/api/execute", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -888,9 +888,9 @@ function Message({ msg, sessionId, onExecuted, onRegistered, onMessageUpdate }) 
         setRegDesc(msg.intent || "Derived analysis result");
       }
     }
-  };
+  }, [msg, sessionId, onExecuted]);
 
-  const handleRetry = async () => {
+  const handleRetry = useCallback(async () => {
     const code = codeText;
     if (!code) return;
     setRetrying(true);
@@ -922,9 +922,9 @@ function Message({ msg, sessionId, onExecuted, onRegistered, onMessageUpdate }) 
     } finally {
       setRetrying(false);
     }
-  };
+  }, [codeText, msg.id, onMessageUpdate, sessionId, shownResult]);
 
-  const handleRegister = async () => {
+  const handleRegister = useCallback(async () => {
     const r = await fetch("/api/register-derived", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -937,7 +937,7 @@ function Message({ msg, sessionId, onExecuted, onRegistered, onMessageUpdate }) 
     });
     const d = await r.json();
     if (d.success) { setRegistered(true); onRegistered(); }
-  };
+  }, [msg.pendingId, onRegistered, regDesc, regName, sessionId]);
 
   return (
     <div className={`message ${msg.role}`}>
@@ -1024,24 +1024,28 @@ function Message({ msg, sessionId, onExecuted, onRegistered, onMessageUpdate }) 
       </div>
     </div>
   );
-}
+  });
 
-const CHART_COLORS = ["#58a6ff","#3fb950","#f78166","#d2a8ff","#ffa657","#79c0ff","#56d364","#ff7b72"];
-
-function DataframeLineChart({ preview }) {
+const DataframeLineChart = React.memo(function DataframeLineChart({ preview }) {
   const { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } = Recharts;
-  const cols = preview.columns;
+  const cols = preview.columns || [];
+  const rowValues = (row) => Array.isArray(row) ? row : Object.values(row || {});
+
   // only chart numeric columns
-  const numericCols = cols.filter((_, ci) =>
-    preview.data.some(row => typeof row[ci] === "number" && !isNaN(row[ci]))
+  const numericCols = cols.filter((col, ci) =>
+    preview.data.some(row => {
+      const value = rowValues(row)[ci];
+      return typeof value === "number" && !isNaN(value);
+    })
   );
   if (numericCols.length === 0) return null;
 
   const chartData = preview.index.map((idx, i) => {
+    const values = rowValues(preview.data[i]);
     const point = { _index: String(idx) };
     numericCols.forEach(col => {
       const ci = cols.indexOf(col);
-      point[col] = preview.data[i][ci];
+      point[col] = values[ci];
     });
     return point;
   });
@@ -1063,9 +1067,9 @@ function DataframeLineChart({ preview }) {
       </ResponsiveContainer>
     </div>
   );
-}
+});
 
-function ResultDisplay({ result }) {
+const ResultDisplay = React.memo(function ResultDisplay({ result }) {
   if (result.output_type === "scalar") {
     return <div className="result-scalar">{result.output_preview}</div>;
   }
@@ -1078,11 +1082,12 @@ function ResultDisplay({ result }) {
     );
   }
   const preview = result.output_preview;
+  const rowValues = (row) => Array.isArray(row) ? row : Object.values(row || {});
   const columns = result.output_type === "dataframe"
     ? ["index", ...preview.columns]
     : ["index", preview.name || "value"];
   const rows = result.output_type === "dataframe"
-    ? preview.index.map((idx, i) => [idx, ...preview.data[i]])
+    ? preview.index.map((idx, i) => [idx, ...rowValues(preview.data[i])])
     : preview.index.map((idx, i) => [idx, preview.values[i]]);
 
   return (
@@ -1109,7 +1114,7 @@ function ResultDisplay({ result }) {
       </div>
     </div>
   );
-}
+});
 
 ReactDOM.render(<App />, document.getElementById("root"));
 </script>
