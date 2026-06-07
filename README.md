@@ -27,15 +27,10 @@ uv run pytest -v
 # Run a single test
 uv run pytest test_artifact_registry.py::test_name -v
 
-# Start chat UI (Anthropic, default)
-export ANTHROPIC_API_KEY=sk-ant-...
-uv run python chat_server.py
-# → http://localhost:8000
-
-# Start chat UI (OpenAI)
-export LLM_PROVIDER=openai
+# Start chat UI
 export OPENAI_API_KEY=sk-...
 uv run python chat_server.py
+# → http://localhost:8000
 ```
 
 ## Synthetic fixtures

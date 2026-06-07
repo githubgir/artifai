@@ -345,7 +345,7 @@ A local, dependency-light chat interface for interactive testing of the full sta
 
 ### 10.2 Technology
 
-Single-page React application served from a Python FastAPI backend. No build step required — React loaded via CDN. The UI connects to the Anthropic API via the backend (API key in environment variable, never sent to the browser).
+Single-page React application served from a Python FastAPI backend. No build step required — React loaded via CDN. The UI connects to the OpenAI API via the backend (API key in environment variable, never sent to the browser).
 
 ### 10.3 Layout
 
