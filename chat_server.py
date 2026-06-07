@@ -341,6 +341,94 @@ async def chat(
     session = get_session(session_id)
     extra_context = ""
 
+    # ── /execute command — bypass LLM and run code directly ───────────────────
+    stripped = message.strip()
+    if stripped.startswith("/execute"):
+        import re as _re
+        raw_code = stripped[len("/execute"):].strip()
+        fence = _re.search(r"```(?:python)?\s*(.*?)```", raw_code, _re.DOTALL)
+        code = fence.group(1).strip() if fence else raw_code
+
+        from artifact_registry import _ast_check
+        violations = _ast_check(code)
+        if violations:
+            return {
+                "text": "Direct execution blocked.",
+                "intent": "/execute",
+                "has_code": True,
+                "code": code,
+                "pending_execution_id": None,
+                "ast_error": "Code blocked: " + "; ".join(violations),
+                "trace": [],
+                "system_prompt": None,
+                "direct_result": None,
+                "manifest": session.registry.manifest(),
+            }
+
+        import pandas as pd
+        import numpy as np
+
+        result: ExecutionResult = run_analysis(
+            code=code,
+            registry=session.registry,
+            requested_artefacts=extract_requested_artefacts(code, session.registry.names()),
+            timeout=30,
+        )
+
+        output_preview = None
+        output_type = None
+        exec_id = None
+        if result.success and result.output is not None:
+            if isinstance(result.output, pd.DataFrame):
+                output_type = "dataframe"
+                output_preview = {
+                    "columns": list(result.output.columns),
+                    "index": [str(i) for i in result.output.index[:10]],
+                    "data": result.output.head(10).values.tolist(),
+                    "shape": list(result.output.shape),
+                }
+            elif isinstance(result.output, pd.Series):
+                output_type = "series"
+                output_preview = {
+                    "name": result.output.name,
+                    "index": [str(i) for i in result.output.index[:10]],
+                    "values": result.output.head(10).tolist(),
+                    "len": len(result.output),
+                }
+            elif isinstance(result.output, np.ndarray):
+                output_type = "ndarray"
+                output_preview = {"shape": list(result.output.shape), "data": result.output.tolist()}
+            else:
+                output_type = "scalar"
+                output_preview = str(result.output)
+
+            exec_id = str(uuid.uuid4())
+            session.pending_results[exec_id] = {
+                "code": code,
+                "output": result.output,
+                "artefacts": extract_requested_artefacts(code, session.registry.names()),
+            }
+
+        return {
+            "text": f"/execute ran {len(code.splitlines())} line(s) of code.",
+            "intent": "/execute",
+            "has_code": True,
+            "code": code,
+            "pending_execution_id": exec_id,
+            "ast_error": None,
+            "trace": [],
+            "system_prompt": None,
+            "direct_result": {
+                "success": result.success,
+                "output_type": output_type,
+                "output_preview": output_preview,
+                "stdout": result.stdout,
+                "error": result.error,
+                "duration_ms": result.duration_ms,
+            },
+            "manifest": session.registry.manifest(),
+        }
+
     if file and file.filename:
         raw = await file.read()
         try:
