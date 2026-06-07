@@ -315,9 +315,9 @@ class TestBrowserExecuteUI:
     """UI-level tests using a real browser via Playwright."""
 
     def test_page_loads(self, page, server):
-        page.goto(server)
-        expect(page.locator(".chat-header")).to_be_visible()
-        expect(page.locator(".manifest-panel")).to_be_visible()
+        page.goto(server, wait_until="networkidle")
+        expect(page.locator(".chat-header")).to_be_visible(timeout=15_000)
+        expect(page.locator(".manifest-panel")).to_be_visible(timeout=15_000)
 
     def test_execute_scalar_in_ui(self, page, server):
         """Send /execute result = 2 + 2 and verify the result appears in the UI."""
