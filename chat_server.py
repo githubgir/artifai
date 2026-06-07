@@ -55,20 +55,20 @@ def get_session(session_id: str) -> Session:
 # Set LLM_PROVIDER=openai to use OpenAI; defaults to anthropic.
 # ─────────────────────────────────────────────────────────────────────────────
 
-LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "openai").lower()
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "anthropic").lower()
 
 if LLM_PROVIDER == "openai":
     import openai as _openai
-    _openai_client = _openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
+    _openai_client = _openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY") or "")
     _OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 else:
     import anthropic as _anthropic
-    _anthropic_client = _anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+    _anthropic_client = _anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY") or "")
     _ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
 
 
 def _llm_complete(*, system: str, messages: list[dict], max_tokens: int = 1500) -> str:
-    """Call the configured LLM and return the assistant text."""
+    """Call the configured LLM and return the assistant text (no tools)."""
     if LLM_PROVIDER == "openai":
         oai_messages = [{"role": "system", "content": system}] + messages
         resp = _openai_client.chat.completions.create(
@@ -76,7 +76,7 @@ def _llm_complete(*, system: str, messages: list[dict], max_tokens: int = 1500) 
             max_tokens=max_tokens,
             messages=oai_messages,
         )
-        return resp.choices[0].message.content
+        return resp.choices[0].message.content or ""
     else:
         resp = _anthropic_client.messages.create(
             model=_ANTHROPIC_MODEL,
@@ -84,7 +84,7 @@ def _llm_complete(*, system: str, messages: list[dict], max_tokens: int = 1500) 
             system=system,
             messages=messages,
         )
-        return resp.content[0].text
+        return next((b.text for b in resp.content if hasattr(b, "text")), "")
 
 
 def _llm_simple(*, prompt: str, max_tokens: int = 200) -> str:
@@ -110,27 +110,170 @@ SYSTEM_PROMPT = """You are an analytical assistant with access to a registry of 
 {manifest}
 
 ## Your Capabilities
-You can analyse these artefacts by generating Python code. When you want to run analysis:
-1. Briefly describe what you are going to do in plain English (the "intent")
-2. Then write the code in a ```python block
+Call the `run_analysis` tool whenever the user asks for data analysis, computation, or transformation.
+Set `intent` to a one-sentence plain-English description of what you're doing.
+After the tool returns a result, interpret it for a non-technical user.
+For questions that don't need code, just answer directly.
 
-## Code Rules
+## Code Rules (for run_analysis)
 - Only use: pd (pandas), np (numpy), and the named artefact variables
 - No imports of any kind
 - Assign your final output to a variable called `result`
-- You may only reference artefacts that appear in the manifest above
-
-## Response Format for Analysis
-When proposing code, structure your response as:
-
-INTENT: <one sentence plain English description>
-```python
-<your code here>
-```
-
-For questions that don't need code, just answer directly.
-After analysis runs, interpret the result for a non-technical user.
+- You may only reference artefacts listed in the manifest above
 """
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool definitions for run_analysis
+# ─────────────────────────────────────────────────────────────────────────────
+
+_TOOL_DESCRIPTION = (
+    "Execute Python analysis code against the artefact registry. "
+    "Only pd (pandas) and np (numpy) are available — no imports. "
+    "Assign the final result to a variable named `result`."
+)
+
+_ANTHROPIC_TOOL: dict = {
+    "name": "run_analysis",
+    "description": _TOOL_DESCRIPTION,
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "intent": {"type": "string", "description": "One-sentence plain-English description of what this code does."},
+            "code":   {"type": "string", "description": "Python code to execute. Must assign output to `result`. No imports."},
+        },
+        "required": ["intent", "code"],
+    },
+}
+
+_OPENAI_TOOL: dict = {
+    "type": "function",
+    "function": {
+        "name": "run_analysis",
+        "description": _TOOL_DESCRIPTION,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "intent": {"type": "string", "description": "One-sentence plain-English description of what this code does."},
+                "code":   {"type": "string", "description": "Python code to execute. Must assign output to `result`. No imports."},
+            },
+            "required": ["intent", "code"],
+        },
+    },
+}
+
+
+def _llm_chat(
+    *, system: str, messages: list[dict], max_tokens: int = 1500
+) -> tuple[str | None, str | None, str | None, str | None]:
+    """
+    Call the LLM with the run_analysis tool available.
+
+    Returns (text, intent, code, tool_id):
+      - Conversational reply : (text, None, None, None)
+      - Tool call            : (None, intent, code, tool_id)
+    """
+    if LLM_PROVIDER == "openai":
+        oai_messages = [{"role": "system", "content": system}] + messages
+        resp = _openai_client.chat.completions.create(
+            model=_OPENAI_MODEL,
+            max_tokens=max_tokens,
+            messages=oai_messages,
+            tools=[_OPENAI_TOOL],
+            tool_choice="auto",
+        )
+        choice = resp.choices[0]
+        if choice.finish_reason == "tool_calls":
+            tc = choice.message.tool_calls[0]
+            args = json.loads(tc.function.arguments)
+            return None, args.get("intent", ""), args.get("code", ""), tc.id
+        return choice.message.content or "", None, None, None
+    else:
+        resp = _anthropic_client.messages.create(
+            model=_ANTHROPIC_MODEL,
+            max_tokens=max_tokens,
+            system=system,
+            messages=messages,
+            tools=[_ANTHROPIC_TOOL],
+        )
+        if resp.stop_reason == "tool_use":
+            tb = next(b for b in resp.content if b.type == "tool_use")
+            return None, tb.input.get("intent", ""), tb.input.get("code", ""), tb.id
+        text = next((b.text for b in resp.content if hasattr(b, "text")), "")
+        return text, None, None, None
+
+
+def _append_tool_call(history: list[dict], tool_id: str, intent: str, code: str) -> None:
+    """Append provider-native assistant tool-call message to history."""
+    if LLM_PROVIDER == "openai":
+        history.append({
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": tool_id, "type": "function",
+                            "function": {"name": "run_analysis",
+                                         "arguments": json.dumps({"intent": intent, "code": code})}}],
+        })
+    else:
+        history.append({
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": tool_id,
+                         "name": "run_analysis", "input": {"intent": intent, "code": code}}],
+        })
+
+
+def _append_tool_result(history: list[dict], tool_id: str, result_text: str) -> None:
+    """Append provider-native tool result to history."""
+    if LLM_PROVIDER == "openai":
+        history.append({"role": "tool", "tool_call_id": tool_id, "content": result_text})
+    else:
+        history.append({"role": "user", "content": [{"type": "tool_result",
+                                                       "tool_use_id": tool_id,
+                                                       "content": result_text}]})
+
+
+def _maybe_close_pending_tool(history: list[dict]) -> None:
+    """
+    If the conversation ends with a dangling tool call (the user sent a new message
+    without running the proposed code), inject a synthetic skip result so the
+    history stays valid for the next LLM call.
+    """
+    if not history:
+        return
+    last = history[-1]
+    if LLM_PROVIDER == "openai":
+        if last.get("role") == "assistant" and last.get("tool_calls"):
+            for tc in last["tool_calls"]:
+                history.append({"role": "tool", "tool_call_id": tc["id"],
+                                 "content": "User skipped this execution."})
+    else:
+        content = last.get("content")
+        if last.get("role") == "assistant" and isinstance(content, list):
+            tool_uses = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_use"]
+            if tool_uses:
+                history.append({"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": b["id"],
+                     "content": "User skipped this execution."}
+                    for b in tool_uses
+                ]})
+
+
+def _format_result_for_llm(result: "ExecutionResult", output_type: str | None, output_preview: Any) -> str:
+    """Summarise an execution result as text for the LLM interpretation call."""
+    if not result.success:
+        return f"Execution failed: {result.error}"
+    if output_type == "scalar":
+        return f"Result: {output_preview}"
+    if output_type == "dataframe":
+        cols  = output_preview.get("columns", [])
+        shape = output_preview.get("shape", [])
+        rows  = output_preview.get("data", [])[:5]
+        sample = "\n".join(str(r) for r in rows)
+        return f"DataFrame shape={shape}, columns={cols}.\nFirst rows:\n{sample}"
+    if output_type == "series":
+        return (f"Series '{output_preview.get('name')}', length={output_preview.get('len')}, "
+                f"first values={output_preview.get('values', [])[:5]}")
+    if output_type == "ndarray":
+        return f"NumPy array shape={output_preview.get('shape')}"
+    return "Execution succeeded."
 
 def llm_describe_file(filename: str, df) -> str:
     """Call the LLM to describe an uploaded file."""
@@ -384,21 +527,21 @@ async def chat(
             "manifest": session.registry.manifest(),
         }
 
-    # ── Build messages ─────────────────────────────────────────────────────────
+    # ── Resolve any dangling tool call the user skipped ───────────────────────
+    _maybe_close_pending_tool(session.history)
+
+    # ── Call LLM with tool support ────────────────────────────────────────────
     system = SYSTEM_PROMPT.format(manifest=session.registry.manifest())
     session.history.append({"role": "user", "content": message + extra_context})
 
-    # ── Call LLM ──────────────────────────────────────────────────────────────
-    assistant_text = _llm_complete(system=system, messages=session.history, max_tokens=1500)
-    session.history.append({"role": "assistant", "content": assistant_text})
-
-    # ── Parse for code ────────────────────────────────────────────────────────
-    intent, code = parse_intent_and_code(assistant_text)
+    text, intent, code, tool_id = _llm_chat(system=system, messages=session.history, max_tokens=1500)
 
     pending_id = None
     ast_error = None
 
-    if code:
+    if tool_id:
+        # LLM wants to run analysis — store the tool call in history and queue it
+        _append_tool_call(session.history, tool_id, intent, code)
         from artifact_registry import _ast_check
         violations = _ast_check(code)
         if violations:
@@ -407,13 +550,19 @@ async def chat(
             pending_id = str(uuid.uuid4())
             session.pending_results[pending_id] = {
                 "code": code,
+                "tool_id": tool_id,
                 "artefacts": extract_requested_artefacts(code, session.registry.names()),
             }
+        display_text = f"I'll {intent.rstrip('.')}." if intent else "I'll run this analysis."
+    else:
+        # Plain conversational reply
+        session.history.append({"role": "assistant", "content": text})
+        display_text = text
 
     return {
-        "text": assistant_text,
+        "text": display_text,
         "intent": intent,
-        "has_code": code is not None,
+        "has_code": tool_id is not None,
         "pending_execution_id": pending_id,
         "ast_error": ast_error,
         "manifest": session.registry.manifest(),
@@ -469,6 +618,16 @@ def execute(body: dict):
         # Store output for potential registration
         session.pending_results[execution_id]["output"] = result.output
 
+    # Feed result back to the LLM and get an interpretation
+    interpretation = None
+    tool_id = pending.get("tool_id")
+    if tool_id:
+        result_summary = _format_result_for_llm(result, output_type, output_preview)
+        _append_tool_result(session.history, tool_id, result_summary)
+        system = SYSTEM_PROMPT.format(manifest=session.registry.manifest())
+        interpretation = _llm_complete(system=system, messages=session.history, max_tokens=800)
+        session.history.append({"role": "assistant", "content": interpretation})
+
     return {
         "success": result.success,
         "output_type": output_type,
@@ -476,6 +635,7 @@ def execute(body: dict):
         "stdout": result.stdout,
         "error": result.error,
         "duration_ms": result.duration_ms,
+        "interpretation": interpretation,
     }
 
 
@@ -741,6 +901,10 @@ function App() {
     setMessages(m => m.map(msg => (msg.id === id ? { ...msg, ...patch } : msg)));
   };
 
+  const addMessage = (msg) => {
+    setMessages(m => [...m, msg]);
+  };
+
   const handleSend = async () => {
     if (!input.trim() && !file) return;
     const userMsg = { role: "user", text: input + (file ? ` [📎 ${file.name}]` : ""), id: Date.now().toString() };
@@ -820,7 +984,7 @@ function App() {
           {messages.map(msg => (
             <Message key={msg.id} msg={msg} sessionId={SESSION_ID}
                      onExecuted={refreshManifest} onRegistered={refreshManifest}
-                     onMessageUpdate={updateMessage} />
+                     onMessageUpdate={updateMessage} onAddMessage={addMessage} />
           ))}
           {loading && (
             <div className="message assistant">
@@ -863,7 +1027,7 @@ function App() {
   );
 }
 
-function Message({ msg, sessionId, onExecuted, onRegistered, onMessageUpdate }) {
+function Message({ msg, sessionId, onExecuted, onRegistered, onMessageUpdate, onAddMessage }) {
   const [showCode, setShowCode] = useState(false);
   const [execResult, setExecResult] = useState(null);
   const [skipped, setSkipped] = useState(false);
@@ -897,6 +1061,9 @@ function Message({ msg, sessionId, onExecuted, onRegistered, onMessageUpdate }) 
     if (d.success) {
       setShowCode(true);
       onExecuted();
+      if (d.interpretation) {
+        onAddMessage({ role: "assistant", text: d.interpretation, id: Date.now().toString() });
+      }
       if (d.output_type === "dataframe" || d.output_type === "series") {
         setRegName("derived_" + Date.now().toString().slice(-4));
         setRegDesc(msg.intent || "Derived analysis result");
