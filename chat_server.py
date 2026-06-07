@@ -10,9 +10,6 @@ Usage:
     python chat_server.py
 
 Then open http://localhost:8000
-
-Special chat commands:
-    /execute <python code>   — run code directly, bypassing the LLM
 """
 
 from __future__ import annotations
@@ -24,7 +21,7 @@ from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, File, Form, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from artifact_registry import ArtefactRegistry, ExecutionResult, Provenance, run_analysis, ingest_file
 from fixtures import make_registry
@@ -37,7 +34,7 @@ class Session:
     def __init__(self):
         self.registry = ArtefactRegistry()
         self.history: list[dict] = []
-        self.pending_results: dict[str, Any] = {}   # execution_id → output
+        self.pending_results: dict[str, Any] = {}
 
 SESSIONS: dict[str, Session] = {}
 
@@ -62,38 +59,18 @@ def _get_client() -> "_openai.OpenAI":
     return _openai_client
 
 
-def _llm_complete(*, system: str, messages: list[dict], max_tokens: int = 1500) -> str:
-    """Call the LLM and return the assistant text (no tools)."""
-    oai_messages = [{"role": "system", "content": system}] + messages
-    resp = _get_client().chat.completions.create(
-        model=_OPENAI_MODEL,
-        max_tokens=max_tokens,
-        messages=oai_messages,
-    )
-    return resp.choices[0].message.content or ""
-
-
-def _llm_simple(*, prompt: str, max_tokens: int = 200) -> str:
-    """Call the LLM with a single user prompt (no system message)."""
-    resp = _get_client().chat.completions.create(
-        model=_OPENAI_MODEL,
-        max_tokens=max_tokens,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return resp.choices[0].message.content or ""
-
 SYSTEM_PROMPT = """You are an analytical assistant with access to a registry of tabular datasets.
 
 ## Available Artefacts
 {manifest}
 
 ## Your Capabilities
-Call the `run_analysis` tool whenever the user asks for data analysis, computation, or transformation.
-Set `intent` to a one-sentence plain-English description of what you're doing.
-After the tool returns a result, interpret it for a non-technical user.
+Use the `execute_and_summarize` tool to run Python analysis code and get a summary of the result.
+Iterate (calling the tool multiple times) until your code produces the correct, desired output.
+Once you have working code that produces the right result, summarize the findings for the user in plain English.
 For questions that don't need code, just answer directly.
 
-## Code Rules (for run_analysis)
+## Code Rules (for execute_and_summarize)
 - Only use: pd (pandas), np (numpy), and the named artefact variables
 - No imports of any kind
 - Assign your final output to a variable called `result`
@@ -101,25 +78,31 @@ For questions that don't need code, just answer directly.
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tool definitions for run_analysis
+# Tool definition — single tool, single LLM call point
 # ─────────────────────────────────────────────────────────────────────────────
 
-_TOOL_DESCRIPTION = (
-    "Execute Python analysis code against the artefact registry. "
-    "Only pd (pandas) and np (numpy) are available — no imports. "
-    "Assign the final result to a variable named `result`."
-)
-
-_ANALYSIS_TOOL: dict = {
+_EXECUTE_AND_SUMMARIZE_TOOL: dict = {
     "type": "function",
     "function": {
-        "name": "run_analysis",
-        "description": _TOOL_DESCRIPTION,
+        "name": "execute_and_summarize",
+        "description": (
+            "Execute Python analysis code against the artefact registry and receive a compact summary of the result. "
+            "Only pd (pandas) and np (numpy) are available — no imports. "
+            "Assign the final result to a variable named `result`. "
+            "Returns df.describe()/shape for DataFrames, scalar value, or an error message. "
+            "Call iteratively (up to 10 times) to refine your code until it produces the desired output."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
-                "intent": {"type": "string", "description": "One-sentence plain-English description of what this code does."},
-                "code":   {"type": "string", "description": "Python code to execute. Must assign output to `result`. No imports."},
+                "intent": {
+                    "type": "string",
+                    "description": "One-sentence plain-English description of what this code does.",
+                },
+                "code": {
+                    "type": "string",
+                    "description": "Python code to execute. Must assign output to `result`. No imports.",
+                },
             },
             "required": ["intent", "code"],
         },
@@ -127,127 +110,140 @@ _ANALYSIS_TOOL: dict = {
 }
 
 
-def _llm_chat(
-    *, system: str, messages: list[dict], max_tokens: int = 1500
-) -> tuple[str | None, str | None, str | None, str | None]:
-    """
-    Call the LLM with the run_analysis tool available.
-
-    Returns (text, intent, code, tool_id):
-      - Conversational reply : (text, None, None, None)
-      - Tool call            : (None, intent, code, tool_id)
-    """
-    oai_messages = [{"role": "system", "content": system}] + messages
-    resp = _get_client().chat.completions.create(
-        model=_OPENAI_MODEL,
-        max_tokens=max_tokens,
-        messages=oai_messages,
-        tools=[_ANALYSIS_TOOL],
-        tool_choice="auto",
-    )
-    choice = resp.choices[0]
-    if choice.finish_reason == "tool_calls":
-        tc = choice.message.tool_calls[0]
-        args = json.loads(tc.function.arguments)
-        return None, args.get("intent", ""), args.get("code", ""), tc.id
-    return choice.message.content or "", None, None, None
-
-
-def _append_tool_call(history: list[dict], tool_id: str, intent: str, code: str) -> None:
-    """Append assistant tool-call message to history."""
-    history.append({
-        "role": "assistant",
-        "content": None,
-        "tool_calls": [{"id": tool_id, "type": "function",
-                        "function": {"name": "run_analysis",
-                                     "arguments": json.dumps({"intent": intent, "code": code})}}],
-    })
-
-
-def _append_tool_result(history: list[dict], tool_id: str, result_text: str) -> None:
-    """Append tool result to history."""
-    history.append({"role": "tool", "tool_call_id": tool_id, "content": result_text})
-
-
-def _maybe_close_pending_tool(history: list[dict]) -> None:
-    """
-    If the conversation ends with a dangling tool call (the user sent a new message
-    without running the proposed code), inject a synthetic skip result so the
-    history stays valid for the next LLM call.
-    """
-    if not history:
-        return
-    last = history[-1]
-    if last.get("role") == "assistant" and last.get("tool_calls"):
-        for tc in last["tool_calls"]:
-            history.append({"role": "tool", "tool_call_id": tc["id"],
-                             "content": "User skipped this execution."})
-
-
-def _format_result_for_llm(result: "ExecutionResult", output_type: str | None, output_preview: Any) -> str:
-    """Summarise an execution result as text for the LLM interpretation call."""
-    if not result.success:
-        return f"Execution failed: {result.error}"
-    if output_type == "scalar":
-        return f"Result: {output_preview}"
-    if output_type == "dataframe":
-        cols  = output_preview.get("columns", [])
-        shape = output_preview.get("shape", [])
-        rows  = output_preview.get("data", [])[:5]
-        sample = "\n".join(str(r) for r in rows)
-        return f"DataFrame shape={shape}, columns={cols}.\nFirst rows:\n{sample}"
-    if output_type == "series":
-        return (f"Series '{output_preview.get('name')}', length={output_preview.get('len')}, "
-                f"first values={output_preview.get('values', [])[:5]}")
-    if output_type == "ndarray":
-        return f"NumPy array shape={output_preview.get('shape')}"
-    return "Execution succeeded."
-
-def llm_describe_file(filename: str, df) -> str:
-    """Call the LLM to describe an uploaded file."""
-    sample = df.head(3).to_string()
-    schema = df.dtypes.to_string()
-    return _llm_simple(
-        prompt=(
-            f"File: '{filename}'\nSchema:\n{schema}\nFirst 3 rows:\n{sample}\n\n"
-            "Describe in one plain-English sentence what this file contains "
-            "and what it could be used for in data analysis. No preamble."
-        ),
-        max_tokens=100,
-    ).strip()
-
-
-def parse_intent_and_code(text: str) -> tuple[str | None, str | None]:
-    """Extract INTENT and code block from LLM response."""
-    import re
-    intent = None
-    code = None
-
-    intent_match = re.search(r"INTENT:\s*(.+?)(?:\n|$)", text)
-    if intent_match:
-        intent = intent_match.group(1).strip()
-
-    code_match = re.search(r"```python\s*(.*?)```", text, re.DOTALL)
-    if code_match:
-        code = code_match.group(1).strip()
-
-    return intent, code
-
-
 def extract_requested_artefacts(code: str, available: list[str]) -> list[str]:
-    """Find which artefact names appear in the code."""
     return [name for name in available if name in code]
 
 
-def extract_code_block(text: str) -> str | None:
-    """Return the first fenced Python code block, if present."""
-    import re
-    match = re.search(r"```python\s*(.*?)```", text, re.DOTALL)
-    return match.group(1).strip() if match else None
+def _execute_and_summarize(code: str, registry) -> str:
+    """Execute code in the registry sandbox and return a compact text summary for the LLM."""
+    import pandas as pd
+    import numpy as np
+    from artifact_registry import _ast_check
+
+    violations = _ast_check(code)
+    if violations:
+        return "Code blocked by safety check: " + "; ".join(violations)
+
+    requested = extract_requested_artefacts(code, registry.names())
+    result = run_analysis(code=code, registry=registry, requested_artefacts=requested, timeout=30)
+
+    if not result.success:
+        return f"Execution error: {result.error}"
+
+    out = result.output
+    if out is None:
+        return "Execution succeeded. result was None."
+
+    if isinstance(out, pd.DataFrame):
+        try:
+            desc = out.describe().to_string()
+        except Exception:
+            desc = "(describe failed)"
+        return f"DataFrame shape={out.shape}, columns={list(out.columns)}.\ndescribe():\n{desc}"
+
+    if isinstance(out, pd.Series):
+        try:
+            desc = out.describe().to_string()
+        except Exception:
+            desc = f"len={len(out)}"
+        return f"Series '{out.name}', len={len(out)}.\ndescribe():\n{desc}"
+
+    if isinstance(out, np.ndarray):
+        return f"NumPy array shape={out.shape}, dtype={out.dtype}"
+
+    try:
+        s = str(out)
+        return f"Result ({type(out).__name__}): {s[:500]}"
+    except Exception:
+        return f"Result type: {type(out).__name__}"
+
+
+def _llm_loop(
+    *, system: str, messages: list[dict], registry, max_iterations: int = 10
+) -> dict:
+    """
+    Single LLM call point. Runs the LLM with execute_and_summarize tool in a loop
+    until it returns a final text response (or max_iterations is reached).
+
+    Returns dict: {text, code, intent, new_history_entries, trace}
+    """
+    oai_messages = [{"role": "system", "content": system}] + messages
+    trace: list[dict] = []
+    last_successful_code: str | None = None
+    last_successful_intent: str | None = None
+    new_entries: list[dict] = []
+
+    for i in range(max_iterations):
+        resp = _get_client().chat.completions.create(
+            model=_OPENAI_MODEL,
+            max_tokens=2000,
+            messages=oai_messages,
+            tools=[_EXECUTE_AND_SUMMARIZE_TOOL],
+            tool_choice="auto",
+        )
+        choice = resp.choices[0]
+
+        if choice.finish_reason == "tool_calls":
+            tc = choice.message.tool_calls[0]
+            args = json.loads(tc.function.arguments)
+            intent = args.get("intent", "")
+            code = args.get("code", "")
+
+            summary = _execute_and_summarize(code, registry)
+            success = not summary.startswith("Execution error:") and not summary.startswith("Code blocked")
+            if success:
+                last_successful_code = code
+                last_successful_intent = intent
+
+            trace.append({
+                "turn": i + 1,
+                "type": "tool_call",
+                "intent": intent,
+                "code": code,
+                "result": summary,
+                "success": success,
+            })
+
+            asst_msg: dict = {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": "execute_and_summarize", "arguments": tc.function.arguments},
+                }],
+            }
+            tool_msg: dict = {"role": "tool", "tool_call_id": tc.id, "content": summary}
+            oai_messages.append(asst_msg)
+            oai_messages.append(tool_msg)
+            new_entries.append(asst_msg)
+            new_entries.append(tool_msg)
+
+        else:
+            text = choice.message.content or ""
+            trace.append({"turn": i + 1, "type": "text", "text": text})
+            asst_entry: dict = {"role": "assistant", "content": text}
+            new_entries.append(asst_entry)
+            return {
+                "text": text,
+                "code": last_successful_code,
+                "intent": last_successful_intent,
+                "new_history_entries": new_entries,
+                "trace": trace,
+            }
+
+    text = "I reached the maximum number of analysis iterations."
+    new_entries.append({"role": "assistant", "content": text})
+    return {
+        "text": text,
+        "code": last_successful_code,
+        "intent": last_successful_intent,
+        "new_history_entries": new_entries,
+        "trace": trace,
+    }
 
 
 def serialise_artefact_data(data: Any, max_rows: int = 100) -> dict[str, Any]:
-    """Return a JSON-friendly view of an artefact payload for API callers."""
     import numpy as np
     import pandas as pd
 
@@ -272,12 +268,7 @@ def serialise_artefact_data(data: Any, max_rows: int = 100) -> dict[str, Any]:
             "truncated": len(data) > max_rows,
         }
     if isinstance(data, np.ndarray):
-        return {
-            "data_type": "ndarray",
-            "data": data.tolist(),
-            "shape": list(data.shape),
-        }
-
+        return {"data_type": "ndarray", "data": data.tolist(), "shape": list(data.shape)}
     return {"data_type": type(data).__name__.lower(), "data": data}
 
 
@@ -315,7 +306,6 @@ def get_artefact(name: str, session_id: str = "default"):
         art = session.registry.get_artefact(name)
     except KeyError as exc:
         return JSONResponse(status_code=404, content={"error": str(exc)})
-
     return {
         "name": art.name,
         "provenance": art.provenance.value,
@@ -351,50 +341,32 @@ async def chat(
     session = get_session(session_id)
     extra_context = ""
 
-    # ── Handle file upload ────────────────────────────────────────────────────
-    if file and file.filename:
-        raw = await file.read()
-        try:
-            ingested = ingest_file(
-                file.filename, raw,
-                llm_describe=llm_describe_file,
-            )
-            session.registry.register(
-                name=ingested.suggested_artefact_name,
-                data=ingested.df,
-                description=ingested.description,
-                provenance=Provenance.USER_UPLOAD,
-            )
-            extra_context = (
-                f"\n[File uploaded: `{ingested.suggested_artefact_name}` — "
-                f"{ingested.description}. "
-                f"Classification: {ingested.classification}. "
-                f"Shape: {ingested.df.shape}]"
-            )
-        except Exception as e:
-            extra_context = f"\n[File upload failed: {e}]"
-
     # ── /execute command — bypass LLM and run code directly ───────────────────
     stripped = message.strip()
     if stripped.startswith("/execute"):
-        raw_code = stripped[len("/execute"):].strip()
-        # Support optional ```python ... ``` fences
         import re as _re
+        raw_code = stripped[len("/execute"):].strip()
         fence = _re.search(r"```(?:python)?\s*(.*?)```", raw_code, _re.DOTALL)
         code = fence.group(1).strip() if fence else raw_code
 
         from artifact_registry import _ast_check
         violations = _ast_check(code)
         if violations:
-            ast_error = "Code blocked: " + "; ".join(violations)
             return {
                 "text": "Direct execution blocked.",
                 "intent": "/execute",
                 "has_code": True,
+                "code": code,
                 "pending_execution_id": None,
-                "ast_error": ast_error,
+                "ast_error": "Code blocked: " + "; ".join(violations),
+                "trace": [],
+                "system_prompt": None,
+                "direct_result": None,
                 "manifest": session.registry.manifest(),
             }
+
+        import pandas as pd
+        import numpy as np
 
         result: ExecutionResult = run_analysis(
             code=code,
@@ -403,11 +375,9 @@ async def chat(
             timeout=30,
         )
 
-        import pandas as pd
-        import numpy as np
-
         output_preview = None
         output_type = None
+        exec_id = None
         if result.success and result.output is not None:
             if isinstance(result.output, pd.DataFrame):
                 output_type = "dataframe"
@@ -433,17 +403,21 @@ async def chat(
                 output_preview = str(result.output)
 
             exec_id = str(uuid.uuid4())
-            session.pending_results[exec_id] = {"code": code, "output": result.output,
-                                                  "artefacts": extract_requested_artefacts(code, session.registry.names())}
-        else:
-            exec_id = None
+            session.pending_results[exec_id] = {
+                "code": code,
+                "output": result.output,
+                "artefacts": extract_requested_artefacts(code, session.registry.names()),
+            }
 
         return {
             "text": f"/execute ran {len(code.splitlines())} line(s) of code.",
             "intent": "/execute",
             "has_code": True,
+            "code": code,
             "pending_execution_id": exec_id,
             "ast_error": None,
+            "trace": [],
+            "system_prompt": None,
             "direct_result": {
                 "success": result.success,
                 "output_type": output_type,
@@ -455,50 +429,54 @@ async def chat(
             "manifest": session.registry.manifest(),
         }
 
-    # ── Resolve any dangling tool call the user skipped ───────────────────────
-    _maybe_close_pending_tool(session.history)
+    if file and file.filename:
+        raw = await file.read()
+        try:
+            ingested = ingest_file(file.filename, raw)
+            session.registry.register(
+                name=ingested.suggested_artefact_name,
+                data=ingested.df,
+                description=ingested.description or f"Uploaded: {file.filename}",
+                provenance=Provenance.USER_UPLOAD,
+            )
+            extra_context = (
+                f"\n[File uploaded: `{ingested.suggested_artefact_name}` — "
+                f"classification: {ingested.classification}, shape: {ingested.df.shape}]"
+            )
+        except Exception as e:
+            extra_context = f"\n[File upload failed: {e}]"
 
-    # ── Call LLM with tool support ────────────────────────────────────────────
-    system = SYSTEM_PROMPT.format(manifest=session.registry.manifest())
     session.history.append({"role": "user", "content": message + extra_context})
+    system = SYSTEM_PROMPT.format(manifest=session.registry.manifest())
 
-    text, intent, code, tool_id = _llm_chat(system=system, messages=session.history, max_tokens=1500)
+    loop_result = _llm_loop(system=system, messages=session.history, registry=session.registry)
+
+    for entry in loop_result["new_history_entries"]:
+        session.history.append(entry)
 
     pending_id = None
-    ast_error = None
-
-    if tool_id:
-        # LLM wants to run analysis — store the tool call in history and queue it
-        _append_tool_call(session.history, tool_id, intent, code)
-        from artifact_registry import _ast_check
-        violations = _ast_check(code)
-        if violations:
-            ast_error = "Code blocked: " + "; ".join(violations)
-        else:
-            pending_id = str(uuid.uuid4())
-            session.pending_results[pending_id] = {
-                "code": code,
-                "tool_id": tool_id,
-                "artefacts": extract_requested_artefacts(code, session.registry.names()),
-            }
-        display_text = f"I'll {intent.rstrip('.')}." if intent else "I'll run this analysis."
-    else:
-        # Plain conversational reply
-        session.history.append({"role": "assistant", "content": text})
-        display_text = text
+    if loop_result["code"]:
+        pending_id = str(uuid.uuid4())
+        session.pending_results[pending_id] = {
+            "code": loop_result["code"],
+            "artefacts": extract_requested_artefacts(loop_result["code"], session.registry.names()),
+        }
 
     return {
-        "text": display_text,
-        "intent": intent,
-        "has_code": tool_id is not None,
+        "text": loop_result["text"],
+        "intent": loop_result["intent"],
+        "code": loop_result["code"],
+        "has_code": loop_result["code"] is not None,
         "pending_execution_id": pending_id,
-        "ast_error": ast_error,
+        "trace": loop_result["trace"],
+        "system_prompt": system,
         "manifest": session.registry.manifest(),
     }
 
 
 @app.post("/api/execute")
 def execute(body: dict):
+    """User-approved execution of the final code proposed by the LLM loop."""
     session_id = body.get("session_id", "default")
     execution_id = body["execution_id"]
     session = get_session(session_id)
@@ -514,10 +492,11 @@ def execute(body: dict):
         timeout=30,
     )
 
-    output_preview = None
-    output_type = None
     import pandas as pd
     import numpy as np
+
+    output_preview = None
+    output_type = None
 
     if result.success and result.output is not None:
         if isinstance(result.output, pd.DataFrame):
@@ -543,18 +522,7 @@ def execute(body: dict):
             output_type = "scalar"
             output_preview = str(result.output)
 
-        # Store output for potential registration
         session.pending_results[execution_id]["output"] = result.output
-
-    # Feed result back to the LLM and get an interpretation
-    interpretation = None
-    tool_id = pending.get("tool_id")
-    if tool_id:
-        result_summary = _format_result_for_llm(result, output_type, output_preview)
-        _append_tool_result(session.history, tool_id, result_summary)
-        system = SYSTEM_PROMPT.format(manifest=session.registry.manifest())
-        interpretation = _llm_complete(system=system, messages=session.history, max_tokens=800)
-        session.history.append({"role": "assistant", "content": interpretation})
 
     return {
         "success": result.success,
@@ -563,60 +531,6 @@ def execute(body: dict):
         "stdout": result.stdout,
         "error": result.error,
         "duration_ms": result.duration_ms,
-        "interpretation": interpretation,
-    }
-
-
-@app.post("/api/retry")
-def retry_execution(body: dict):
-    session_id = body.get("session_id", "default")
-    code = body.get("code") or ""
-    error = body.get("error") or ""
-    session = get_session(session_id)
-
-    if not code:
-        return {"success": False, "error": "No code supplied for retry"}
-
-    prompt = (
-        "You are fixing a failed Python analysis script. "
-        "The previous attempt failed with the following error:\n"
-        f"{error}\n\n"
-        "Please rewrite the code to fix the error while keeping the same overall intent. "
-        "Return only the INTENT line and one ```python``` code block. "
-        "Use only pandas, numpy, and the named artefacts already available in the session. "
-        "Assign the final result to a variable named `result`.\n\n"
-        "Previous code:\n"
-        f"```python\n{code}\n```"
-    )
-
-    assistant_text = _llm_complete(
-        system=SYSTEM_PROMPT.format(manifest=session.registry.manifest()),
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=1500,
-    )
-    intent, new_code = parse_intent_and_code(assistant_text)
-
-    if not new_code:
-        return {"success": False, "error": "Retry model did not return any code"}
-
-    from artifact_registry import _ast_check
-    violations = _ast_check(new_code)
-    if violations:
-        return {"success": False, "error": "Retry code blocked: " + "; ".join(violations)}
-
-    pending_id = str(uuid.uuid4())
-    session.pending_results[pending_id] = {
-        "code": new_code,
-        "artefacts": extract_requested_artefacts(new_code, session.registry.names()),
-    }
-
-    return {
-        "success": True,
-        "text": assistant_text,
-        "intent": intent,
-        "has_code": True,
-        "pending_execution_id": pending_id,
-        "ast_error": None,
     }
 
 
@@ -775,12 +689,38 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 .send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .loading-dot { display: inline-block; animation: blink 1s infinite; }
 @keyframes blink { 0%,100%{opacity:0.2} 50%{opacity:1} }
+
+/* LLM Trace */
+.trace-section { margin-top: 10px; font-size: 11px; border-top: 1px solid #30363d; padding-top: 8px; }
+.trace-summary { color: #7d8590; cursor: pointer; user-select: none; padding: 2px 0;
+                 display: flex; align-items: center; gap: 4px; }
+.trace-summary:hover { color: #c9d1d9; }
+.trace-body { margin-top: 8px; }
+.trace-sys-toggle { color: #7d8590; cursor: pointer; font-size: 10px; user-select: none;
+                    margin-bottom: 4px; display: flex; align-items: center; gap: 4px; }
+.trace-sys-toggle:hover { color: #c9d1d9; }
+.trace-system { background: #0d1117; border: 1px solid #30363d; border-radius: 4px;
+                padding: 6px 8px; font-family: monospace; font-size: 10px; color: #7d8590;
+                white-space: pre-wrap; max-height: 120px; overflow-y: auto; margin-bottom: 10px; }
+.trace-turn { margin-bottom: 10px; padding-left: 8px; border-left: 2px solid #30363d; }
+.trace-turn-header { color: #388bfd; font-weight: 700; font-size: 10px; text-transform: uppercase;
+                     letter-spacing: 0.06em; margin-bottom: 3px; }
+.trace-intent { color: #d2a8ff; margin-bottom: 3px; font-size: 11px; }
+.trace-code { background: #0d1117; border: 1px solid #30363d; border-radius: 4px;
+              padding: 6px 8px; font-family: monospace; font-size: 10px; color: #c9d1d9;
+              white-space: pre-wrap; max-height: 150px; overflow-y: auto; margin-bottom: 4px; }
+.trace-result { font-family: monospace; font-size: 10px; white-space: pre-wrap;
+                max-height: 80px; overflow-y: auto; padding: 4px 6px;
+                background: #161b22; border-radius: 4px; }
+.trace-result.ok { color: #3fb950; }
+.trace-result.err { color: #f85149; }
+.trace-final { font-size: 10px; color: #8b949e; font-style: italic; }
 </style>
 </head>
 <body>
 <div id="root"></div>
 <script type="text/babel">
-const { useState, useRef, useEffect, useCallback } = React;
+const { useState, useRef, useEffect } = React;
 
 const SESSION_ID = "session_" + Math.random().toString(36).slice(2, 9);
 
@@ -815,7 +755,7 @@ function App() {
     refreshManifest();
     setMessages(m => [...m, {
       role: "assistant", id: Date.now().toString(),
-      text: d.message + "\\n\\nYou can now ask me to analyse these datasets. Try: 'What does the return distribution look like for the top 10 stocks?' or 'Join the latest benchmark weights to the universe metadata.'"
+      text: d.message + "\\n\\nYou can now ask me to analyse these datasets."
     }]);
   };
 
@@ -827,10 +767,6 @@ function App() {
 
   const updateMessage = (id, patch) => {
     setMessages(m => m.map(msg => (msg.id === id ? { ...msg, ...patch } : msg)));
-  };
-
-  const addMessage = (msg) => {
-    setMessages(m => [...m, msg]);
   };
 
   const handleSend = async () => {
@@ -854,10 +790,11 @@ function App() {
         role: "assistant", id: Date.now().toString(),
         text: d.text,
         intent: d.intent,
+        code: d.code,
         pendingId: d.pending_execution_id,
-        astError: d.ast_error,
         hasCode: d.has_code,
-        directResult: d.direct_result || null,
+        trace: d.trace,
+        systemPrompt: d.system_prompt,
       }]);
     } catch(e) {
       setMessages(m => [...m, { role: "assistant", id: Date.now().toString(), text: "Error: " + e.message }]);
@@ -912,7 +849,7 @@ function App() {
           {messages.map(msg => (
             <Message key={msg.id} msg={msg} sessionId={SESSION_ID}
                      onExecuted={refreshManifest} onRegistered={refreshManifest}
-                     onMessageUpdate={updateMessage} onAddMessage={addMessage} />
+                     onMessageUpdate={updateMessage} />
           ))}
           {loading && (
             <div className="message assistant">
@@ -955,28 +892,63 @@ function App() {
   );
 }
 
-function Message({ msg, sessionId, onExecuted, onRegistered, onMessageUpdate, onAddMessage }) {
+function TraceDisplay({ trace, systemPrompt }) {
+  const [open, setOpen] = useState(false);
+  const [sysOpen, setSysOpen] = useState(false);
+  if (!trace || trace.length === 0) return null;
+  const toolCalls = trace.filter(t => t.type === "tool_call").length;
+  return (
+    <div className="trace-section">
+      <div className="trace-summary" onClick={() => setOpen(o => !o)}>
+        <span>{open ? "▾" : "▸"}</span>
+        <span>LLM trace — {trace.length} turn{trace.length !== 1 ? "s" : ""}
+          {toolCalls > 0 ? `, ${toolCalls} tool call${toolCalls !== 1 ? "s" : ""}` : ""}</span>
+      </div>
+      {open && (
+        <div className="trace-body">
+          {systemPrompt && (
+            <div style={{marginBottom:"8px"}}>
+              <div className="trace-sys-toggle" onClick={() => setSysOpen(o => !o)}>
+                <span>{sysOpen ? "▾" : "▸"}</span>
+                <span>System prompt</span>
+              </div>
+              {sysOpen && <div className="trace-system">{systemPrompt}</div>}
+            </div>
+          )}
+          {trace.map((t, i) => (
+            <div key={i} className="trace-turn">
+              {t.type === "tool_call" ? (
+                <>
+                  <div className="trace-turn-header">Turn {t.turn} — execute_and_summarize {t.success ? "✓" : "✗"}</div>
+                  <div className="trace-intent">Intent: {t.intent}</div>
+                  <div className="trace-code">{t.code}</div>
+                  <div className={`trace-result ${t.success ? "ok" : "err"}`}>{t.result}</div>
+                </>
+              ) : (
+                <>
+                  <div className="trace-turn-header">Turn {t.turn} — final response</div>
+                  <div className="trace-final">{t.text?.slice(0, 200)}{t.text?.length > 200 ? "…" : ""}</div>
+                </>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Message({ msg, sessionId, onExecuted, onRegistered, onMessageUpdate }) {
   const [showCode, setShowCode] = useState(false);
   const [execResult, setExecResult] = useState(null);
   const [skipped, setSkipped] = useState(false);
   const [regName, setRegName] = useState("");
   const [regDesc, setRegDesc] = useState("");
   const [registered, setRegistered] = useState(false);
-  const [retrying, setRetrying] = useState(false);
-
-  const extractCleanText = (text) => {
-    return text
-      .replace(/INTENT:.*?\\n/s, "")
-      .replace(/```python[\\s\\S]*?```/g, "")
-      .trim();
-  };
-
-  const cleanText = extractCleanText(msg.text);
-  const shownResult = execResult || msg.directResult;
 
   useEffect(() => {
-    if (shownResult) setShowCode(true);
-  }, [shownResult]);
+    if (execResult) setShowCode(true);
+  }, [execResult]);
 
   const handleRun = async () => {
     const r = await fetch("/api/execute", {
@@ -987,48 +959,11 @@ function Message({ msg, sessionId, onExecuted, onRegistered, onMessageUpdate, on
     const d = await r.json();
     setExecResult(d);
     if (d.success) {
-      setShowCode(true);
       onExecuted();
-      if (d.interpretation) {
-        onAddMessage({ role: "assistant", text: d.interpretation, id: Date.now().toString() });
-      }
       if (d.output_type === "dataframe" || d.output_type === "series") {
         setRegName("derived_" + Date.now().toString().slice(-4));
         setRegDesc(msg.intent || "Derived analysis result");
       }
-    }
-  };
-
-  const handleRetry = async () => {
-    const code = msg.text.match(/```python\\s*([\\s\\S]*?)```/)?.[1] || "";
-    if (!code) return;
-    setRetrying(true);
-    try {
-      const r = await fetch("/api/retry", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          session_id: sessionId,
-          code,
-          error: shownResult?.error || "",
-        }),
-      });
-      const d = await r.json();
-      if (d.success) {
-        onMessageUpdate(msg.id, {
-          text: d.text,
-          intent: d.intent,
-          pendingId: d.pending_execution_id,
-          astError: d.ast_error,
-          hasCode: d.has_code,
-          directResult: null,
-        });
-        setExecResult(null);
-        setShowCode(true);
-        setRegistered(false);
-      }
-    } finally {
-      setRetrying(false);
     }
   };
 
@@ -1047,64 +982,57 @@ function Message({ msg, sessionId, onExecuted, onRegistered, onMessageUpdate, on
     if (d.success) { setRegistered(true); onRegistered(); }
   };
 
+  const code = msg.code || "";
+
   return (
     <div className={`message ${msg.role}`}>
       <div className="message-bubble">
-        <div style={{whiteSpace:"pre-wrap"}}>{cleanText}</div>
+        <div style={{whiteSpace:"pre-wrap"}}>{msg.text}</div>
 
-        {msg.astError && (
-          <div className="error-block">
-            <div className="error-label">⛔ Code Blocked</div>
-            <div className="error-text">{msg.astError}</div>
-          </div>
-        )}
-
-        {msg.pendingId && !skipped && !execResult && !msg.directResult && (
+        {msg.pendingId && !skipped && !execResult && (
           <div className="intent-card">
             <div className="intent-label">📊 Proposed Analysis</div>
             <div className="intent-text">{msg.intent || "Run analysis code"}</div>
             <div className="intent-actions">
               <button className="btn-run" onClick={handleRun}>▶ Run</button>
               <button className="btn-skip" onClick={() => setSkipped(true)}>Skip</button>
-              <button className="code-toggle" onClick={() => setShowCode(s => !s)}>
-                {showCode ? "Hide code" : "Show code"}
-              </button>
+              {code && (
+                <button className="code-toggle" onClick={() => setShowCode(s => !s)}>
+                  {showCode ? "Hide code" : "Show code"}
+                </button>
+              )}
             </div>
-            {showCode && (
-              <div className="code-block">
-                {msg.text.match(/```python\\s*([\\s\\S]*?)```/)?.[1] || ""}
-              </div>
+            {showCode && code && <div className="code-block">{code}</div>}
+          </div>
+        )}
+
+        {execResult && msg.pendingId && (
+          <div style={{marginBottom:"6px",marginTop:"6px"}}>
+            {code && (
+              <>
+                <button className="code-toggle" onClick={() => setShowCode(s => !s)}>
+                  {showCode ? "Hide code" : "Show code"}
+                </button>
+                {showCode && <div className="code-block">{code}</div>}
+              </>
             )}
           </div>
         )}
 
-        {shownResult && msg.pendingId && (
-          <div style={{marginBottom:"6px"}}>
-            <button className="code-toggle" onClick={() => setShowCode(s => !s)}>
-              {showCode ? "Hide code" : "Show code"}
-            </button>
-            {showCode && (
-              <div className="code-block">
-                {msg.text.match(/```python\\s*([\\s\\S]*?)```/)?.[1] || ""}
-              </div>
-            )}
-          </div>
-        )}
-
-        {shownResult && (
+        {execResult && (
           <div className="result-block">
-            {shownResult.success ? (
+            {execResult.success ? (
               <>
                 <div className="result-label">
-                  ✓ Result ({shownResult.output_type}) — {shownResult.duration_ms?.toFixed(0)}ms
+                  ✓ Result ({execResult.output_type}) — {execResult.duration_ms?.toFixed(0)}ms
                 </div>
-                <ResultDisplay result={shownResult} />
-                {shownResult.stdout && (
+                <ResultDisplay result={execResult} />
+                {execResult.stdout && (
                   <div style={{marginTop:"6px",fontSize:"12px",color:"#7d8590",fontFamily:"monospace"}}>
-                    stdout: {shownResult.stdout}
+                    stdout: {execResult.stdout}
                   </div>
                 )}
-                {(shownResult.output_type === "dataframe" || shownResult.output_type === "series") && !registered && msg.pendingId && (
+                {(execResult.output_type === "dataframe" || execResult.output_type === "series") && !registered && msg.pendingId && (
                   <div className="register-form">
                     <div className="register-label">💾 Save as artefact?</div>
                     <div className="register-inputs">
@@ -1123,16 +1051,13 @@ function Message({ msg, sessionId, onExecuted, onRegistered, onMessageUpdate, on
             ) : (
               <div className="error-block">
                 <div className="error-label">⚠ Execution Error</div>
-                <div className="error-text">{(shownResult.error || "").split("\\n").slice(-3).join("\\n")}</div>
-                {msg.pendingId && (
-                  <button className="btn-run" style={{marginTop:"8px"}} onClick={handleRetry} disabled={retrying}>
-                    {retrying ? "Retrying..." : "Retry"}
-                  </button>
-                )}
+                <div className="error-text">{(execResult.error || "").split("\\n").slice(-3).join("\\n")}</div>
               </div>
             )}
           </div>
         )}
+
+        <TraceDisplay trace={msg.trace} systemPrompt={msg.systemPrompt} />
       </div>
     </div>
   );
@@ -1143,7 +1068,6 @@ const CHART_COLORS = ["#58a6ff","#3fb950","#f78166","#d2a8ff","#ffa657","#79c0ff
 function DataframeLineChart({ preview }) {
   const { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } = Recharts;
   const cols = preview.columns;
-  // only chart numeric columns
   const numericCols = cols.filter((_, ci) =>
     preview.data.some(row => typeof row[ci] === "number" && !isNaN(row[ci]))
   );
