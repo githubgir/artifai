@@ -45,7 +45,7 @@ def registry() -> ArtefactRegistry:
         "position_history": "Monthly rebalancing weights (benchmark + index) and market cap per stock",
         "factor_exposures": "Factor loading matrix at monthly rebalancing dates: Value, Quality, Momentum, Low Vol, Size",
         "user_signals":     "Weekly proprietary signals per ISIN: Proprietary 1, Proprietary 2",
-        "price_dividends":  "Daily price and quarterly dividend history for 1 000 instruments",
+        "price_dividends":  "Daily price and quarterly dividend history per instrument",
     }
     for name, data in make_all_fixtures().items():
         reg.register(

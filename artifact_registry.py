@@ -248,6 +248,10 @@ def run_analysis(
 
     Convention: code must assign its final output to `result`.
     """
+    # Strip redundant pd/np imports already provided by the execution environment
+    import re as _re
+    code = _re.sub(r"^\s*import\s+(?:pandas\s+as\s+pd|numpy\s+as\s+np)\s*\n?", "", code, flags=_re.MULTILINE)
+
     # 1. AST safety check
     violations = _ast_check(code)
     if violations:
