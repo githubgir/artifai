@@ -134,7 +134,7 @@ class ArtefactRegistry:
         for art in self._store.values():
             icon = _PROVENANCE_ICON[art.provenance]
             tag  = f"[{art.provenance.value}]"
-            line = f"{icon} {tag:<14} `{art.name}`  {art.dtype_summary:<30}  {art.description}"
+            line = f"##{art.name}\n{icon} {tag:<14} `{art.name}`  {art.dtype_summary:<30}  {art.description}"
             if art.parent_artefacts:
                 line += f"\n   derived from: {', '.join(art.parent_artefacts)}"
             lines.append(line)

@@ -298,7 +298,7 @@ _FIXTURE_DESCRIPTIONS = {
     "stock_returns": (
         "Index: date — daily business days from 2020-01-02 to 2025-01-01 (~1 305 rows). "
         "Columns: instrument_id (1 000 stocks). "
-        "Values: daily total return r_t = p_t/p_{t-1}−1 with GARCH-like vol clustering. "
+        "Values: daily total return r_t = (p_t + d_t)/p_{t-1}−1 reflecting price change and dividends. It already is the result of total_return_index.pct_change()."
         "FREQUENCY: daily. To combine with position_history or factor_exposures (monthly effective_date), "
         "forward-fill or asof-join on the date axis first."
     ),
