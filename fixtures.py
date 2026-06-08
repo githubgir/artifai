@@ -219,6 +219,67 @@ def make_factor_exposures() -> pd.DataFrame:
     )
 
 
+def make_price_dividends() -> pd.DataFrame:
+    """
+    Daily price and quarterly dividend history.
+
+    Index   : (trading_date, instrument_id) — MultiIndex; DAILY frequency.
+              trading_date = business days from 2020-01-02 to 2025-01-01 (~1 305 rows).
+              instrument_id is a shared key with all other fixtures.
+    Columns : price — end-of-day price (positive, log-normal walk seeded from 10–500 range).
+              dividend — cash dividend per share; non-zero once per quarter per instrument
+              on a staggered payment date, up to 5 % of the prevailing price; zero otherwise.
+
+    ALIGNMENT: trading_date (daily) aligns with date in stock_returns.
+    Can be joined to universe on instrument_id.
+    """
+    rng = np.random.default_rng(48)
+    dates = _business_dates()
+    ids = _instrument_ids()
+    n_dates = len(dates)
+    n = N_INSTRUMENTS
+
+    # Simulate prices as a geometric random walk
+    initial_prices = rng.uniform(10.0, 500.0, size=n)
+    daily_log_ret = rng.normal(loc=0.0002, scale=0.015, size=(n_dates, n))
+    log_prices = np.log(initial_prices)[None, :] + np.cumsum(daily_log_ret, axis=0)
+    prices = np.exp(log_prices)  # (n_dates, n)
+
+    # Dividends: each instrument pays once per calendar quarter on a staggered day.
+    # Stagger by assigning each instrument a fixed day-of-quarter offset (0-59 bday offset).
+    quarter_offsets = rng.integers(0, 60, size=n)  # per-instrument offset within quarter
+    div_rates = rng.uniform(0.0, 0.05, size=n)     # per-instrument max div yield
+
+    dividends = np.zeros((n_dates, n))
+    dates_series = pd.Series(dates)
+    # Mark which date index is a "quarter start" business-day index
+    quarter_starts = np.where(
+        (dates_series.dt.month.isin([1, 4, 7, 10]) & (dates_series.dt.is_month_start | True)).values
+        & (dates_series.dt.is_quarter_start.values | dates_series.dt.to_period("Q").ne(
+            dates_series.shift(1).dt.to_period("Q")
+        ).values)
+    )[0]
+    # For each quarter start, each instrument pays on (quarter_start + offset) if in range
+    for qs in quarter_starts:
+        pay_idx = qs + quarter_offsets  # (n,)
+        in_range = pay_idx < n_dates
+        for inst_i in np.where(in_range)[0]:
+            d_idx = pay_idx[inst_i]
+            dividends[d_idx, inst_i] = div_rates[inst_i] * prices[d_idx, inst_i]
+
+    midx = pd.MultiIndex.from_arrays(
+        [np.repeat(dates, n), np.tile(ids, n_dates)],
+        names=["trading_date", "instrument_id"],
+    )
+    return pd.DataFrame(
+        {
+            "price":    prices.ravel(),
+            "dividend": dividends.ravel(),
+        },
+        index=midx,
+    )
+
+
 def make_user_signals() -> pd.DataFrame:
     """
     Proprietary signal matrix at weekly (Wednesday) signal dates.
@@ -286,6 +347,7 @@ def make_all_fixtures() -> dict:
         "position_history": make_position_history(),
         "factor_exposures": make_factor_exposures(),
         "user_signals":     make_user_signals(),
+        "price_dividends":  make_price_dividends(),
     }
 
 
@@ -325,6 +387,16 @@ _FIXTURE_DESCRIPTIONS = {
         "Columns: 'Proprietary 1', 'Proprietary 2' (AR(1) persistence across signal dates). "
         "Join to other artefacts via ISIN. "
         "FREQUENCY: weekly. Use asof-join or forward-fill to align with daily date or monthly effective_date."
+    ),
+    "price_dividends": (
+        "Index: MultiIndex (trading_date, instrument_id). "
+        "trading_date is daily business-day frequency from 2020-01-02 to 2025-01-01 (~1 305 rows). "
+        "instrument_id covers all 1 000 instruments in the universe. "
+        "Columns: price (end-of-day price, always positive, log-normal random walk); "
+        "dividend (cash dividend per share, non-zero once per quarter per instrument on a staggered "
+        "payment date, up to 5 % of the prevailing price, zero on all other days). "
+        "FREQUENCY: daily. Aligns directly with stock_returns on (trading_date ↔ date, instrument_id). "
+        "Join to universe on instrument_id."
     ),
 }
 
