@@ -49,7 +49,9 @@ def get_session(session_id: str) -> Session:
 # ─────────────────────────────────────────────────────────────────────────────
 
 import openai as _openai
-_OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+_OPENAI_MODELS = ["gpt-o4-mini", "gpt-4o", "gpt-5"]
+_OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5")
+print(_OPENAI_MODEL)
 _openai_client: "_openai.OpenAI | None" = None
 
 def _get_client() -> "_openai.OpenAI":
@@ -176,7 +178,7 @@ def _llm_loop(
     for i in range(max_iterations):
         resp = _get_client().chat.completions.create(
             model=_OPENAI_MODEL,
-            max_tokens=2000,
+            #max_tokens=2000,
             messages=oai_messages,
             tools=[_EXECUTE_AND_SUMMARIZE_TOOL],
             tool_choice="auto",

@@ -1,5 +1,8 @@
 # Examples
 
+## Stock returns
+calculate stock returns from price changes and dividends
+
 ## Benchmark/Index returns
 
 ### simple
